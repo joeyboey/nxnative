@@ -45,7 +45,7 @@ DM_REGISTER("swtest", odd_entry, odd_b, {"b", 47, NULL});
 
 static const void *section(const char *name, size_t size, size_t align, unsigned long *count) {
     unsigned long bytes = 0;
-    const void *p = getsectiondata(&_mh_execute_header, "__DATA", name, &bytes);
+    const void *p = getsectiondata(DM_HOST_IMAGE, "__DATA", name, &bytes);
     assert(p && bytes && bytes % size == 0 && (uintptr_t)p % align == 0);
     *count = bytes / size; return p;
 }

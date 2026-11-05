@@ -1042,7 +1042,7 @@ int main(int argc, char **argv) {
     if (fixture) test_argument_buffers(fixture);
 
     unsigned long sz;
-    const hle_ent *sec = (const hle_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swhle", &sz);
+    const hle_ent *sec = (const hle_ent *)getsectiondata(DM_HOST_IMAGE, "__DATA", "swhle", &sz);
     unsigned count = 0;
     for (unsigned long i = 0; i < sz / sizeof *sec; i++)
         if (!strncmp(sec[i].name, "gl", 2)) {

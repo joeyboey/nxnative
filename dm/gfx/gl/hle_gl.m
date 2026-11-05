@@ -26,8 +26,7 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <TargetConditionals.h>
 #include <mach/mach.h>
-#include <mach-o/getsect.h>
-#include <mach-o/ldsyms.h>
+#include "../../host/host_image.h"
 #include <math.h>
 #include <stdatomic.h>
 #include <time.h>
@@ -3318,7 +3317,7 @@ EGL(eglSwapBuffers, EGLBoolean, EGLDisplay d, EGLSurface s) {
 // glVertexAttribPointerNV takes other arguments than glVertexAttribPointer, glGetProgramivARB asks about an ARB assembly program
 static void *gl_entry(const char *name) {
     static const hle_ent *sec; static unsigned long sz;
-    if (!sec) sec = (const hle_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swhle", &sz);
+    if (!sec) sec = (const hle_ent *)getsectiondata(DM_HOST_IMAGE, "__DATA", "swhle", &sz);
     for (unsigned long i = 0; i < sz / sizeof *sec; i++) if (!strcmp(sec[i].name, name)) return sec[i].fn;
     return NULL;
 }
