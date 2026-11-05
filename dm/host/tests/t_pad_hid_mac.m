@@ -73,6 +73,8 @@ static IOReturn test_set_report(IOHIDDeviceRef d, IOHIDReportType t, CFIndex id,
     (void)d; assert(t == kIOHIDReportTypeOutput && id == r[0] && n >= 12 && nouts < 64);
     outs[nouts][0] = r[0]; outs[nouts][1] = r[10]; outs[nouts][2] = r[11]; nouts++; return kIOReturnSuccess;
 }
+static IOReturn test_open_close(IOHIDDeviceRef d, IOOptionBits o) { (void)d; (void)o; return kIOReturnSuccess; }
+static void test_schedule(IOHIDDeviceRef d, CFRunLoopRef l, CFStringRef m) { (void)d; (void)l; (void)m; }
 
 static uint64_t tick = 1000000000;
 uint64_t now_ns(void) { return tick; }
@@ -118,6 +120,10 @@ static void advance_timers(uint64_t ns) {
 #define IOHIDElementGetUsage test_el_usage
 #define IOHIDElementGetReportID test_el_report
 #define IOHIDElementGetType test_el_type
+#define IOHIDDeviceOpen test_open_close
+#define IOHIDDeviceClose test_open_close
+#define IOHIDDeviceScheduleWithRunLoop test_schedule
+#define IOHIDDeviceUnscheduleFromRunLoop test_schedule
 #define GCController TestGC
 #define dispatch_time test_dispatch_time
 #define dispatch_after test_dispatch_after
@@ -128,6 +134,7 @@ static void advance_timers(uint64_t ns) {
 #undef dispatch_after
 
 static int attached, changes;
+static int hidpad_available(IOHIDDeviceRef d) { (void)d; return 1; }
 static void hidpad_attach(hid_pad *d) { (void)d; attached++; }
 static void hidpad_detach(hid_pad *d) { (void)d; attached--; }
 static int reads;
