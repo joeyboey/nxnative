@@ -104,6 +104,13 @@ int duo_harness_rumble(void) { return g_rumble; }
 void dm_haptics_apple_init(void) {}
 void dm_haptics_apple_controller(int player, GCController *controller) { (void)player; (void)controller; }
 
+int front_web_touch(void) { return 0; }   // no offline web page above the synthetic game
+int dm_locate_game_data(void) { return 1; }
+const struct dm_profile *dm_profile(void) {
+    static const struct dm_profile profile = {.name = "DuoHarness", .pad_layout = DM_GAME_PAD_LAYOUT};
+    return &profile;
+}
+
 int front_ios_boot_ok(void) { return 1; }
 void front_ios_boot(void) {}
 bool dm_show_launcher(void *viewController, void (*done)(void)) { (void)viewController; (void)done; return false; }
