@@ -1672,6 +1672,14 @@ HLE_FORCE("_ZN2nn3hid20IsVibrationPermittedEv", "vibration permission: the app's
     if (getenv("DM_RUMBLE_LOG")) { static _Atomic int was = -1; if (atomic_exchange(&was, (int)on) != (int)on) LOG("rumble: IsVibrationPermitted -> %u", on); }
     return on;
 }
+// Vibration permit session hooks (hid::detail / hid::system) follow dm_haptics_available() on the host and succeed as no-ops
+// instead of reaching the hid service (a null read in hid::detail::EndPermitVibrationSession, sdk+0x3526bc).
+HLE_FORCE("_ZN2nn3hid6detail27BeginPermitVibrationSessionEv", "permit vibration session: permitted while the host has haptics", Result, h_hid_DetailBeginPermitVib, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn3hid6detail25EndPermitVibrationSessionEv", "permit vibration session: nothing to release", Result, h_hid_DetailEndPermitVib, void) { return RES_OK; }
+HLE_FORCE("_ZN2nn3hid6detail15PermitVibrationEb", "permit vibration: controlled by the host's haptics setting", Result, h_hid_DetailPermitVib, unsigned on) { (void)on; return RES_OK; }
+HLE_FORCE("_ZN2nn3hid6system27BeginPermitVibrationSessionEv", "system permit vibration session: permitted while the host has haptics", void, h_hid_SysBeginPermitVib, void) {}
+HLE_FORCE("_ZN2nn3hid6system25EndPermitVibrationSessionEv", "system permit vibration session: nothing to release", void, h_hid_SysEndPermitVib, void) {}
+HLE_FORCE("_ZN2nn3hid6system15PermitVibrationEb", "system permit vibration: controlled by the host's haptics setting", void, h_hid_SysPermitVib, unsigned on) { (void)on; }
 // Games can cache handles once at startup, before GameController routes the pad's haptics (Unicorn Overlord kept an empty answer and sent every value to handle 0).
 // On Horizon handles are computed from npad id and style (libnx _hidGetVibrationDeviceHandles); vib_send checks for an output at each send. With rumble off they are handed out too,
 // as on a Switch whose vibration setting is off (IsVibrationPermitted answers false and nothing is felt), so turning it on while the game runs works in a game that asked only once.
@@ -1855,6 +1863,8 @@ HLE_FORCE("_ZN2nn3hid32SetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHan
 HLE_FORCE("_ZN2nn3hid34ResetSixAxisSensorFusionParametersERKNS0_19SixAxisSensorHandleE", "six-axis sensor fusion parameters; ignored by the host", void, h_hid_FusionReset, const uint32_t *h) { (void)h; }
 HLE_FORCE("_ZN2nn3hid41IsFirmwareUpdateAvailableForSixAxisSensorERKNS0_19SixAxisSensorHandleE", "six-axis sensor firmware update: none", unsigned, h_hid_SixFw, const uint32_t *h) { (void)h; return 0; }
 // GetActual returns the sanitized guest value accepted by the host, before output-device adaptation.
+// GetVibrationDeviceInfo is queried right after GetVibrationDeviceHandles at startup, before a physical controller's
+// haptics route is registered, so it follows handle validity and sink presence rather than active route availability.
 HLE_FORCE("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21VibrationDeviceHandleE", "vibration: linear resonant actuator, left or right", void, h_hid_VibInfo, uint32_t *info, const uint32_t *h) {
     int m = 0, on = h && vib_valid(*h, &m) != 0;
     info[0] = on ? 1 : 0; info[1] = on ? 1 + m : 0;

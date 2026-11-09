@@ -413,6 +413,10 @@ static void t_vibration(void) {
     CHECK(dm_haptics_actual(0, 0).amplitude_low == 0, "rumble off still drops values for a routed channel");
     dm_haptics_set_enabled(1);
     CHECK(h_hid_VibPermit(), "rumble turned on while the game runs: the handles it took work");
+    h_hid_VibForceBegin(); h_hid_VibForceEnd();
+    h_hid_SysBeginPermitVib(); h_hid_SysEndPermitVib(); h_hid_SysPermitVib(1);
+    CHECK(h_hid_DetailBeginPermitVib() == RES_OK && h_hid_DetailEndPermitVib() == RES_OK && h_hid_DetailPermitVib(1) == RES_OK,
+          "forced/permit vibration session hooks succeed without hid service");
 }
 
 static void t_joycon_vibration_lifetime(void) {
