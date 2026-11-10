@@ -24,9 +24,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/attr.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <dirent.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include "romfs_image.h"
 #include "save_sync.h"
@@ -85,21 +87,39 @@ static void mkdirs(const char *path) {   // mkdir -p
 /// Whether the volume holding `path` can hold a save: the host's save transaction clones the save
 /// folder (clonefile) and publishes a commit by swapping two folders (renamex_np RENAME_SWAP), which
 /// only APFS does (hle_fs.c). 1 yes, 0 no (exFAT, HFS+, FAT, network volumes), -1 when the volume
-/// does not say, which the caller takes as yes.
+/// cannot be asked at all, which the caller takes as yes.
+///
+/// A volume answers in one of two ways. exFAT marks the clone and swap bits valid and clear. HFS+
+/// leaves them out of its valid mask (0x287fff on a journaled HFS+ image), so it does not say: the
+/// filesystem's name decides then, and only APFS can do both.
 static int volume_holds_saves(const char *path) {
     struct attrlist al = {.bitmapcount = ATTR_BIT_MAP_COUNT, .volattr = ATTR_VOL_INFO | ATTR_VOL_CAPABILITIES};
     struct { uint32_t length; vol_capabilities_attr_t caps; } __attribute__((aligned(4), packed)) buf;
-    if (getattrlist(path, &al, &buf, sizeof buf, 0)) return -1;
     uint32_t need = VOL_CAP_INT_CLONE | VOL_CAP_INT_RENAME_SWAP;
-    if ((buf.caps.valid[VOL_CAPABILITIES_INTERFACES] & need) != need) return -1;
-    return (buf.caps.capabilities[VOL_CAPABILITIES_INTERFACES] & need) == need;
+    if (!getattrlist(path, &al, &buf, sizeof buf, 0) && (buf.caps.valid[VOL_CAPABILITIES_INTERFACES] & need) == need)
+        return (buf.caps.capabilities[VOL_CAPABILITIES_INTERFACES] & need) == need;
+    struct statfs fs;
+    if (statfs(path, &fs)) return -1;
+    return !strcmp(fs.f_fstypename, "apfs");
 }
 
-static int dir_has_entries(const char *path) {   // anything inside at all (a save folder, a log folder)
+/// Files macOS writes into any folder that are not part of a save: AppleDouble files (._name, the
+/// metadata beside each file on exFAT and FAT) and the Finder's .DS_Store. Copied, they would be files
+/// of their own in the guest's save, and a library save folder holding only them holds no save.
+static int not_save(const char *name) { return !strncmp(name, "._", 2) || !strcmp(name, ".DS_Store"); }
+
+static int dir_has_entries(const char *path, int saves_only) {   // anything inside at all, or with saves_only anything that is part of a save
     DIR *d = opendir(path); if (!d) return 0;
     struct dirent *e; int any = 0;
-    while ((e = readdir(d))) if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..")) { any = 1; break; }
+    while ((e = readdir(d))) if (strcmp(e->d_name, ".") && strcmp(e->d_name, "..") && !(saves_only && not_save(e->d_name))) { any = 1; break; }
     closedir(d); return any;
+}
+
+/// Whether a save folder holds a save: the folder itself or its device save beside it (<save>_device,
+/// which the host gives a game that mounts a device save, hle_fs.c).
+static int save_set_has(const char *save) {
+    char dev[PATH_MAX]; snprintf(dev, sizeof dev, "%s_device", save);
+    return dir_has_entries(save, 1) || dir_has_entries(dev, 1);
 }
 
 static int copy_file(const char *from, const char *to) {
@@ -108,30 +128,115 @@ static int copy_file(const char *from, const char *to) {
     char buf[1 << 16]; size_t n; int ok = 1;
     while ((n = fread(buf, 1, sizeof buf, in)) > 0) if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
     if (ferror(in)) ok = 0;
+    if (fflush(out) || fsync(fileno(out))) ok = 0;
     fclose(in); if (fclose(out)) ok = 0;
     if (!ok) unlink(to);
     return ok;
 }
 
-/// Recursive copy for the one-time migration of a save folder. Symlinks are followed (a save is
-/// plain files); a file that already exists is left alone, so a half-finished copy can be resumed.
-/// AppleDouble files (._name, the metadata macOS writes beside each file on exFAT and FAT) are not
-/// part of the save and are left behind: copied, they would be files of their own in the guest's save.
-static void copy_tree(const char *from, const char *to) {
-    mkdirs(to);
-    DIR *d = opendir(from); if (!d) return;
-    struct dirent *e;
+/// Recursive copy of a save folder into a new folder. Symlinks are followed (a save is plain
+/// files), and what not_save names is left behind. 1 when every file arrived, 0 at the first one
+/// that did not, with errno set and the path in `failed`: a save with a file missing is not the
+/// save, so the caller drops the copy.
+static int copy_tree(const char *from, const char *to, char *failed, size_t n) {
+    if (mkdir(to, 0755) && errno != EEXIST) { snprintf(failed, n, "%s", to); return 0; }
+    DIR *d = opendir(from); if (!d) { snprintf(failed, n, "%s", from); return 0; }
+    struct dirent *e; int ok = 1;
+    while (ok && (errno = 0, e = readdir(d))) {
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || not_save(e->d_name)) continue;
+        char a[PATH_MAX], b[PATH_MAX]; struct stat st;
+        if (snprintf(a, sizeof a, "%s/%s", from, e->d_name) >= (int)sizeof a || snprintf(b, sizeof b, "%s/%s", to, e->d_name) >= (int)sizeof b) { errno = ENAMETOOLONG; snprintf(failed, n, "%s", a); ok = 0; }
+        else if (stat(a, &st)) { snprintf(failed, n, "%s", a); ok = 0; }
+        else if (S_ISDIR(st.st_mode)) ok = copy_tree(a, b, failed, n);
+        else if (S_ISREG(st.st_mode) && !copy_file(a, b)) { if (!errno) errno = EIO; snprintf(failed, n, "%s", b); ok = 0; }
+    }
+    if (ok && errno) { snprintf(failed, n, "%s", from); ok = 0; }   // readdir stopped on an error, not at the end
+    int saved = errno; closedir(d); errno = saved;
+    return ok;
+}
+
+static int rm_tree(const char *path) {   // rm -rf; 0 when it is gone
+    struct stat st; if (lstat(path, &st)) return errno == ENOENT ? 0 : -1;
+    if (!S_ISDIR(st.st_mode)) return unlink(path);
+    DIR *d = opendir(path); if (!d) return -1;
+    struct dirent *e; int r = 0;
     while ((e = readdir(d))) {
-        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || !strncmp(e->d_name, "._", 2)) continue;
-        char a[PATH_MAX], b[PATH_MAX];
-        snprintf(a, sizeof a, "%s/%s", from, e->d_name);
-        snprintf(b, sizeof b, "%s/%s", to, e->d_name);
-        struct stat st;
-        if (stat(a, &st)) continue;
-        if (S_ISDIR(st.st_mode)) copy_tree(a, b);
-        else if (S_ISREG(st.st_mode) && access(b, F_OK)) copy_file(a, b);
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..")) continue;
+        char p[PATH_MAX]; snprintf(p, sizeof p, "%s/%s", path, e->d_name);
+        if (rm_tree(p)) r = -1;
     }
     closedir(d);
+    return r ? r : rmdir(path);
+}
+
+/// Which save folder is the game's current save, when it can be in two places: beside the app in a
+/// game library folder, or in ~/Library (the library is not on APFS, or the bundle is not in a
+/// library). The launcher writes the folder it started the game on to <sup>/save-location, so the
+/// save the player last played is the one that follows them across a switch, not whichever folder
+/// happens to be empty. Without that file (a build before it, or the folder it names is gone because
+/// the library moved), the library's save is current when it has one: every build since patch 0010
+/// played from it.
+static void current_save(const char *sup, const char *lib, char *cur, size_t n) {
+    char rec[PATH_MAX]; snprintf(rec, sizeof rec, "%s/save-location", sup);
+    *cur = 0; FILE *f = fopen(rec, "r");
+    if (f) { if (!fgets(cur, (int)n, f)) *cur = 0; fclose(f); cur[strcspn(cur, "\n")] = 0; }
+    struct stat st;
+    if (*cur && !stat(cur, &st) && S_ISDIR(st.st_mode)) return;
+    if (*lib && save_set_has(lib)) snprintf(cur, n, "%s", lib);
+    else snprintf(cur, n, "%s/save", sup);
+}
+
+static void record_save(const char *sup, const char *save) {   // <sup>/save-location, replaced in one rename
+    char rec[PATH_MAX], tmp[PATH_MAX]; snprintf(rec, sizeof rec, "%s/save-location", sup); snprintf(tmp, sizeof tmp, "%s.new", rec);
+    mkdirs(sup); FILE *f = fopen(tmp, "w");
+    int ok = f && fprintf(f, "%s\n", save) > 0;
+    if (f && (fflush(f) || fsync(fileno(f)))) ok = 0;
+    if (f && fclose(f)) ok = 0;
+    if (!ok || rename(tmp, rec)) { unlink(tmp); fprintf(stderr, "[RED] launcher: could not record the save folder in %s (errno=%d): the next start falls back to the library's save\n", rec, errno); }
+}
+
+/// Bring the whole save in `from` to `to`, all or nothing: the save and its device save
+/// (<save>_device) are copied into <to>.migrating and <to>_device.migrating first, and only when
+/// both copies are complete are they renamed into place. A save already in `to` (an older
+/// checkpoint) is kept beside it as <to>.replaced-<time>, never merged file by file with the other
+/// one. The source stays as it is: an older build of the same app may still read it. 1 done, 0
+/// failed (`why` says what), with `to` unchanged.
+static int move_save(const char *from, const char *to, char *kept, size_t kn, char *why, size_t wn) {
+    const char *sfx[] = {"", "_device"};
+    char src[2][PATH_MAX], dst[2][PATH_MAX], stage[2][PATH_MAX], aside[2][PATH_MAX], failed[PATH_MAX] = "", parent[PATH_MAX];
+    int has[2];
+    time_t t = time(NULL); struct tm tm; localtime_r(&t, &tm); char stamp[32]; strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
+    snprintf(parent, sizeof parent, "%s", to); char *slash = strrchr(parent, '/'); if (slash) *slash = 0;
+    mkdirs(parent); *kept = 0;
+    for (int i = 0; i < 2; i++) {
+        snprintf(src[i], PATH_MAX, "%s%s", from, sfx[i]); snprintf(dst[i], PATH_MAX, "%s%s", to, sfx[i]);
+        snprintf(stage[i], PATH_MAX, "%s.migrating", dst[i]); snprintf(aside[i], PATH_MAX, "%s.replaced-%s", dst[i], stamp);
+        has[i] = dir_has_entries(src[i], 1);
+        if (rm_tree(stage[i])) { snprintf(why, wn, "cannot clear %s left from an earlier try (%s)", stage[i], strerror(errno)); return 0; }
+    }
+    for (int i = 0; i < 2; i++) if (has[i] && !copy_tree(src[i], stage[i], failed, sizeof failed)) {
+        snprintf(why, wn, "copying %s failed (%s)", failed, strerror(errno));
+        rm_tree(stage[0]); rm_tree(stage[1]); return 0;
+    }
+    // Both copies are complete. Whatever sits in the destination now (the older save, or a device
+    // save that does not belong to the save coming in) is set aside, then the copies take its place.
+    int set_aside[2] = {0, 0};
+    for (int i = 0; i < 2; i++) {
+        if (dir_has_entries(dst[i], 0)) {   // anything at all: rmdir below needs it empty
+            if (rename(dst[i], aside[i])) { snprintf(why, wn, "cannot move the save in %s aside (%s)", dst[i], strerror(errno)); goto undo; }
+            set_aside[i] = 1;
+        } else if (rmdir(dst[i]) && errno != ENOENT) { snprintf(why, wn, "cannot replace %s (%s)", dst[i], strerror(errno)); goto undo; }
+    }
+    for (int i = 0; i < 2; i++) if (has[i] && rename(stage[i], dst[i])) {
+        snprintf(why, wn, "cannot rename %s to %s (%s)", stage[i], dst[i], strerror(errno));
+        if (i) rename(dst[0], stage[0]);   // the first one is already in place: undo it too
+        goto undo;
+    }
+    snprintf(kept, kn, "%s", set_aside[0] ? aside[0] : set_aside[1] ? aside[1] : "");
+    return 1;
+undo:
+    for (int i = 0; i < 2; i++) { if (set_aside[i]) rename(aside[i], dst[i]); rm_tree(stage[i]); }
+    return 0;
 }
 
 static void env_file(const char *path) {   // KEY=VALUE lines, # starts a comment; a variable already set stays
@@ -278,7 +383,7 @@ int main(int argc, char **argv) {
         return 1;
     }
     const char *home = getenv("HOME"); if (!home || !*home) return 1;
-    char library_not_apfs[PATH_MAX] = "";   // a game library folder on a volume that cannot hold saves (volume_holds_saves)
+    char library_not_apfs[PATH_MAX] = "", libsave[PATH_MAX] = "";   // a game library folder on a volume that cannot hold saves (volume_holds_saves)
     char sup[PATH_MAX], save[PATH_MAX], temp[PATH_MAX], logs[PATH_MAX], log[PATH_MAX], prev[PATH_MAX];
     snprintf(sup, sizeof sup, "%s/Library/Application Support/nxnative/%s", home, id);
     snprintf(save, sizeof save, "%s/save", sup); snprintf(temp, sizeof temp, "%s/temp", sup);
@@ -305,18 +410,12 @@ int main(int argc, char **argv) {
         char probe[PATH_MAX]; snprintf(probe, sizeof probe, "%s/.nx2apple-library", appdir);
         if (!stat(probe, &st)) {
             snprintf(logs, sizeof logs, "%s/log", appdir);
+            snprintf(libsave, sizeof libsave, "%s/save/%s", appdir, id);
             if (volume_holds_saves(appdir) == 0) {
                 // A library on exFAT, HFS+ or FAT (an external drive): the host would mount its save
                 // read-only and drop every write while the game says it saved, and cloud saves would
                 // have nothing to send. The save stays in ~/Library on the Mac's own APFS disk; the
-                // log still goes with the game. A save the library folder holds from an earlier
-                // build is copied in, once, as the migration below does the other way.
-                char libsave[PATH_MAX]; snprintf(libsave, sizeof libsave, "%s/save/%s", appdir, id);
-                mkdirs(save);
-                if (dir_has_entries(libsave) && !dir_has_entries(save)) {
-                    copy_tree(libsave, save);
-                    fprintf(stderr, "launcher: saves copied from %s to %s\n", libsave, save);
-                }
+                // log still goes with the game. current_save below brings the library's save across.
                 snprintf(library_not_apfs, sizeof library_not_apfs, "%s", appdir);
                 char noted[PATH_MAX]; snprintf(noted, sizeof noted, "%s/.library-not-apfs-noted", sup);
                 if (stat(noted, &st)) {
@@ -326,21 +425,12 @@ int main(int argc, char **argv) {
                     int fd = open(noted, O_WRONLY | O_CREAT, 0644); if (fd >= 0) close(fd);
                 }
             } else {
-                snprintf(save, sizeof save, "%s/save/%s", appdir, id);
-                // First run after this change: bring the old saves across rather than starting the
-                // player on an empty save slot. Copied, not moved — an older build of the same app
-                // still reads the old place, and a copy is cheap next to a save.
-                char oldsave[PATH_MAX], oldlog[PATH_MAX];
-                snprintf(oldsave, sizeof oldsave, "%s/save", sup);
-                snprintf(oldlog, sizeof oldlog, "%s/Library/Logs/nxnative/%s.log", home, id);
-                mkdirs(save); mkdirs(logs);
-                if (dir_has_entries(oldsave) && !dir_has_entries(save)) {
-                    copy_tree(oldsave, save);
-                    fprintf(stderr, "launcher: saves copied from %s to %s (they now live with the game)\n", oldsave, save);
-                }
+                snprintf(save, sizeof save, "%s", libsave);
                 // The previous session's log becomes the .prev.log, as the rotation below would have
                 // it: the .log itself is opened fresh right after, and copying into it would be
                 // truncated away by that open.
+                char oldlog[PATH_MAX]; snprintf(oldlog, sizeof oldlog, "%s/Library/Logs/nxnative/%s.log", home, id);
+                mkdirs(logs);
                 char newprev[PATH_MAX]; snprintf(newprev, sizeof newprev, "%s/%s.prev.log", logs, id);
                 // Explicit compares, not !stat(): stat() returns -1 when the file is missing, which is
                 // truthy — reading "!" as "does not exist" here inverted the condition and skipped the
@@ -350,6 +440,30 @@ int main(int argc, char **argv) {
                 }
             }
         }
+    }
+    // The save the player last played comes along when the game starts from another save folder
+    // than last time: the library moved to or from a drive that is not APFS, or the bundle moved in
+    // or out of a library. All or nothing (move_save): a game started on part of a save, or on an
+    // older checkpoint while the newer one sits in the other folder, loses progress without a word.
+    char moved[4 * PATH_MAX] = "";
+    // A save folder the launch environment sets (a front end's own choice of folder, DM_SAVE) is the
+    // one the host uses (setenv below keeps it): nothing is moved for it, but it is recorded, so the
+    // next start without it brings that save along.
+    const char *chosen = getenv("DM_SAVE");
+    if (chosen && *chosen) { snprintf(save, sizeof save, "%s", chosen); record_save(sup, save); }
+    else {
+        char cur[PATH_MAX]; current_save(sup, libsave, cur, sizeof cur);
+        if (strcmp(cur, save) && save_set_has(cur)) {
+            char kept[PATH_MAX], why[2 * PATH_MAX];
+            if (!move_save(cur, save, kept, sizeof kept, why, sizeof why)) {
+                char msg[4 * PATH_MAX];
+                snprintf(msg, sizeof msg, "This game's save could not be brought from %s to %s: %s.\n\nThe game was not started, so that it does not start on an incomplete or older save. Both folders are unchanged. Make room on the drive or fix what the message names, then open the game again.", cur, save, why);
+                alert(name, msg); return 1;
+            }
+            snprintf(moved, sizeof moved, "launcher: the save was copied from %s to %s (the folder it was last played from; it stays there too)%s%s", cur, save, *kept ? ", the save that was in its place is kept in " : "", kept);
+            fprintf(stderr, "%s\n", moved);
+        }
+        record_save(sup, save);
     }
     snprintf(log, sizeof log, "%s/%s.log", logs, id); snprintf(prev, sizeof prev, "%s/%s.prev.log", logs, id);
     mkdirs(save); mkdirs(temp); mkdirs(logs);
@@ -361,6 +475,7 @@ int main(int argc, char **argv) {
     if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); setvbuf(stdout, NULL, _IOLBF, 0); }
     fprintf(stderr, "fork patches: %s\n", *fork_patches ? fork_patches : "none");   // first line of the log (Info.plist DMForkPatches)
     fprintf(stderr, "launcher: %s (%s), host %s\n", name, id, host);
+    if (*moved) fprintf(stderr, "%s\n", moved);
     if (*library_not_apfs) fprintf(stderr, "[RED] launcher: the game library %s is not on an APFS volume, which saves need: saves stay in %s\n", library_not_apfs, save);
     CFArrayRef rules = setting_rules();   // the settings the launch environment already set: the window shows them, fixed
     for (CFIndex i = 0; rules && i < CFArrayGetCount(rules); i++) { char env[128]; if (rule_env(CFArrayGetValueAtIndex(rules, i), env, sizeof env) && getenv(env)) add_key(&g_launch_keys, env); }

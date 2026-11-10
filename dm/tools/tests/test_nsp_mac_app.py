@@ -1027,16 +1027,41 @@ int main(void) { @autoreleasepool {
         self.assertIn('standin host output', (logs / f'{TID}.prev.log').read_text())
         self.assertEqual(self.host_run()['DM_LANG'], 'fr')   # Info.plist DMLanguage
 
-    def run_in_library(self, lib, home):   # the app in a game library folder (the .nx2apple-library marker beside it), as the Mac front end lays it out
+    def run_in_library(self, lib, home, code=7, fsize=None, env=None):   # the app in a game library folder (the .nx2apple-library marker beside it), as the Mac front end lays it out
         app = lib / self.app.name
         if not app.exists(): subprocess.run(['ditto', self.app, app], check=True)
-        (home / 'alert.txt').unlink(missing_ok=True)
-        p = subprocess.run([app / 'Contents/MacOS/nxnative'], env=dict(HOME=str(home), PATH=f'{self.tmp / "bin"}:/usr/bin:/bin', DM_LAUNCHER='0'), capture_output=True, text=True, timeout=30)
-        self.assertEqual(p.returncode, 7, p.stdout + p.stderr)
-        return self.host_run_in(home)
+        for name in ('alert.txt', 'host_run.txt'): (home / name).unlink(missing_ok=True)
+        def limit():   # a file-size limit for the launcher alone: a copy that fails partway, as a full drive would
+            import resource; resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize)); signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        p = subprocess.run([app / 'Contents/MacOS/nxnative'], env=dict(HOME=str(home), PATH=f'{self.tmp / "bin"}:/usr/bin:/bin', DM_LAUNCHER='0', **(env or {})),
+                           capture_output=True, text=True, timeout=30, preexec_fn=limit if fsize else None)
+        self.assertEqual(p.returncode, code, p.stdout + p.stderr)
+        return self.host_run_in(home) if code == 7 else None
 
     def host_run_in(self, home):
         return dict(ln.partition('=')[::2] for ln in (home / 'host_run.txt').read_text().splitlines())
+
+    @contextlib.contextmanager
+    def volume(self, fs, name):   # a disk image formatted as `fs` (hdiutil -fs), mounted at tmp/<name>, detached afterwards
+        if not shutil.which('hdiutil'): self.skipTest('needs hdiutil for a disk image')
+        name = f'{name}-{uuid.uuid4().hex[:8]}'   # the test folder is shared by the class's tests
+        image, mnt = self.tmp / f'{name}.dmg', self.tmp / name
+        mnt.mkdir()
+        made = subprocess.run(['hdiutil', 'create', '-size', '32m', '-fs', fs, '-volname', 'NXLIB', '-type', 'UDIF', image], capture_output=True)
+        if made.returncode: self.skipTest(f'hdiutil cannot make a {fs} image here: ' + made.stderr.decode(errors='replace'))
+        if subprocess.run(['hdiutil', 'attach', '-nobrowse', '-mountpoint', mnt, image], capture_output=True).returncode: self.skipTest('hdiutil cannot attach an image here')
+        try: yield mnt
+        finally: subprocess.run(['hdiutil', 'detach', '-force', mnt], capture_output=True)
+
+    def apfs_library(self, name):   # a library folder in the test folder, which has to be on APFS
+        lib = self.tmp / name; lib.mkdir(); (lib / '.nx2apple-library').touch()
+        mounts = [ln.split(' on ', 1)[1].rsplit(' (', 1) for ln in subprocess.run(['mount'], capture_output=True, text=True).stdout.splitlines() if ' on ' in ln]
+        at, opts = max(((m, o) for m, o in mounts if str(lib.resolve()).startswith(m.rstrip('/') + '/')), key=lambda x: len(x[0]), default=('', ''))
+        if not opts.startswith('apfs'): self.skipTest(f'{self.tmp} is not on APFS')
+        return lib
+
+    @staticmethod
+    def sup(home): return home / f'Library/Application Support/nxnative/{TID}'
 
     def test_library_folder_on_apfs(self):   # saves and log beside the app
         lib, home = self.tmp / 'library-apfs', self.tmp / 'home-library-apfs'
@@ -1045,18 +1070,14 @@ int main(void) { @autoreleasepool {
         if r['DM_SAVE'] != str(lib / 'save' / TID): self.skipTest(f'{self.tmp} is not on APFS')
         self.assertIn('standin host output', (lib / f'log/{TID}.log').read_text())
         self.assertFalse((home / 'alert.txt').exists())
+        self.assertEqual((self.sup(home) / 'save-location').read_text(), f'{lib / "save" / TID}\n')   # the folder the game was started on
 
-    @unittest.skipUnless(shutil.which('hdiutil'), 'needs hdiutil for an exFAT volume')
-    def test_library_folder_not_on_apfs(self):   # exFAT cannot clone or swap folders, which a save transaction needs: the host mounted the save read-only and every save was lost
-        home, image, mnt = self.tmp / 'home-library-exfat', self.tmp / 'library.dmg', self.tmp / 'mnt'
-        home.mkdir(); mnt.mkdir()
-        made = subprocess.run(['hdiutil', 'create', '-size', '32m', '-fs', 'ExFAT', '-volname', 'NXLIB', '-type', 'UDIF', image], capture_output=True)
-        if made.returncode: self.skipTest('hdiutil cannot make an exFAT image here: ' + made.stderr.decode(errors='replace'))
-        if subprocess.run(['hdiutil', 'attach', '-nobrowse', '-mountpoint', mnt, image], capture_output=True).returncode: self.skipTest('hdiutil cannot attach an image here')
-        try:
+    def check_not_apfs(self, fs):   # exFAT and HFS+ cannot clone or swap folders, which a save transaction needs: the host mounted the save read-only and every save was lost
+        home = self.tmp / f'home-library-{fs}'; home.mkdir()
+        with self.volume(fs, 'mnt') as mnt:
             lib = mnt / 'Games'; (lib / 'save' / TID).mkdir(parents=True); (lib / '.nx2apple-library').touch()
-            (lib / 'save' / TID / 'savedata0.bin').write_bytes(b'save from an earlier build')   # its ._savedata0.bin is made by macOS on exFAT
-            sup = home / f'Library/Application Support/nxnative/{TID}'
+            (lib / 'save' / TID / 'savedata0.bin').write_bytes(b'save from an earlier build')   # on exFAT macOS makes its ._savedata0.bin
+            sup = self.sup(home)
             r = self.run_in_library(lib, home)
             self.assertEqual(r['DM_SAVE'], str(sup / 'save'))   # on the Mac's own APFS disk, not the library folder
             self.assertEqual(sorted(p.name for p in (sup / 'save').iterdir()), ['savedata0.bin'])   # the earlier save copied in, without the AppleDouble file
@@ -1068,8 +1089,87 @@ int main(void) { @autoreleasepool {
             self.run_in_library(lib, home)
             self.assertFalse((home / 'alert.txt').exists())
             self.assertIn('is not on an APFS volume', (lib / f'log/{TID}.log').read_text())   # the log line at every start
-        finally:
-            subprocess.run(['hdiutil', 'detach', '-force', mnt], capture_output=True)
+
+    def test_library_folder_on_exfat(self): self.check_not_apfs('ExFAT')
+
+    def test_library_folder_on_hfs(self): self.check_not_apfs('HFS+J')   # HFS+ leaves the clone and swap bits out of its valid mask: decided by its name
+
+    def test_library_save_beats_older_home_save(self):   # patch 0010 copied the ~/Library save into the library and kept it: that older copy must not win when the library goes to exFAT
+        home = self.tmp / 'home-older'; home.mkdir()
+        (self.sup(home) / 'save').mkdir(parents=True); (self.sup(home) / 'save/savedata0.bin').write_bytes(b'checkpoint 1')
+        with self.volume('ExFAT', 'mnt') as mnt:
+            lib = mnt / 'Games'; (lib / 'save' / TID).mkdir(parents=True); (lib / '.nx2apple-library').touch()
+            (lib / 'save' / TID / 'savedata0.bin').write_bytes(b'checkpoint 9')
+            r = self.run_in_library(lib, home)
+            save = self.sup(home) / 'save'
+            self.assertEqual(r['DM_SAVE'], str(save))
+            self.assertEqual((save / 'savedata0.bin').read_bytes(), b'checkpoint 9')
+            kept = list(self.sup(home).glob('save.replaced-*'))   # the older save is kept aside, not merged
+            self.assertEqual(len(kept), 1); self.assertEqual((kept[0] / 'savedata0.bin').read_bytes(), b'checkpoint 1')
+            self.assertIn('the save was copied from', (lib / f'log/{TID}.log').read_text())
+            (save / 'savedata0.bin').write_bytes(b'checkpoint 12')   # played on: the next start keeps it
+            self.run_in_library(lib, home)
+            self.assertEqual((save / 'savedata0.bin').read_bytes(), b'checkpoint 12')
+            self.assertEqual(len(list(self.sup(home).glob('save.replaced-*'))), 1)
+
+    def test_library_back_on_apfs(self):   # progress made while the library was on exFAT follows it to an APFS drive, over the library's older save
+        home = self.tmp / 'home-back'; home.mkdir()
+        apfs = self.apfs_library('library-back')
+        with self.volume('ExFAT', 'mnt') as mnt:
+            lib = mnt / 'Games'; (lib / 'save' / TID).mkdir(parents=True); (lib / '.nx2apple-library').touch()
+            (lib / 'save' / TID / 'savedata0.bin').write_bytes(b'checkpoint 3')
+            self.run_in_library(lib, home)
+            (self.sup(home) / 'save/savedata0.bin').write_bytes(b'checkpoint 10')   # played on in ~/Library
+            (self.sup(home) / 'save/sub').mkdir(); (self.sup(home) / 'save/sub/extra.bin').write_bytes(b'x')
+            (self.sup(home) / 'save_device').mkdir(); (self.sup(home) / 'save_device/common.bin').write_bytes(b'device 10')   # a device save (hle_fs.c) comes along with it
+            shutil.copytree(lib / 'save', apfs / 'save', ignore=shutil.ignore_patterns('._*'))   # the library moved to an APFS drive, its old checkpoint with it
+        r = self.run_in_library(apfs, home)
+        save = apfs / 'save' / TID
+        self.assertEqual(r['DM_SAVE'], str(save))
+        self.assertEqual((save / 'savedata0.bin').read_bytes(), b'checkpoint 10')
+        self.assertEqual((save / 'sub/extra.bin').read_bytes(), b'x')
+        self.assertEqual((apfs / 'save' / f'{TID}_device' / 'common.bin').read_bytes(), b'device 10')
+        kept = list((apfs / 'save').glob(f'{TID}.replaced-*'))
+        self.assertEqual(len(kept), 1); self.assertEqual((kept[0] / 'savedata0.bin').read_bytes(), b'checkpoint 3')
+        self.assertEqual((self.sup(home) / 'save/savedata0.bin').read_bytes(), b'checkpoint 10')   # the source stays
+        self.assertEqual((self.sup(home) / 'save-location').read_text(), f'{save}\n')
+
+    def test_library_save_folder_with_only_finder_files(self):   # .DS_Store and ._ files are no save: the ~/Library save stays current
+        home = self.tmp / 'home-finder'; home.mkdir()
+        (self.sup(home) / 'save').mkdir(parents=True); (self.sup(home) / 'save/savedata0.bin').write_bytes(b'checkpoint 5')
+        with self.volume('ExFAT', 'mnt') as mnt:
+            lib = mnt / 'Games'; (lib / 'save' / TID).mkdir(parents=True); (lib / '.nx2apple-library').touch()
+            (lib / 'save' / TID / '.DS_Store').write_bytes(b'finder'); (lib / 'save' / TID / '._x').write_bytes(b'apple double')
+            self.run_in_library(lib, home)
+            self.assertEqual((self.sup(home) / 'save/savedata0.bin').read_bytes(), b'checkpoint 5')
+            self.assertEqual(list(self.sup(home).glob('save.replaced-*')), [])
+
+    def test_library_save_chosen_by_the_front_end(self):   # DM_SAVE from the launch environment is used as it is, and recorded, so the next start without it brings that save along
+        home = self.tmp / 'home-chosen'; home.mkdir()
+        lib = self.apfs_library('library-chosen')
+        chosen = self.tmp / 'chosen-save'; chosen.mkdir(); (chosen / 'savedata0.bin').write_bytes(b'checkpoint 7')
+        r = self.run_in_library(lib, home, env=dict(DM_SAVE=str(chosen)))
+        self.assertEqual(r['DM_SAVE'], str(chosen))
+        self.assertFalse((lib / 'save' / TID).exists() and any((lib / 'save' / TID).iterdir()))   # nothing moved while the front end chose
+        self.assertEqual((self.sup(home) / 'save-location').read_text(), f'{chosen}\n')
+        r = self.run_in_library(lib, home)
+        self.assertEqual(r['DM_SAVE'], str(lib / 'save' / TID))
+        self.assertEqual((lib / 'save' / TID / 'savedata0.bin').read_bytes(), b'checkpoint 7')
+
+    def test_library_save_copy_fails(self):   # a copy that fails partway does not start the game, and the next start tries again
+        home = self.tmp / 'home-fail'; home.mkdir()
+        lib = self.apfs_library('library-fail')
+        old = self.sup(home) / 'save'; old.mkdir(parents=True)
+        (old / 'small.bin').write_bytes(b's' * 1000); (old / 'large.bin').write_bytes(b'L' * (2 << 20))
+        self.run_in_library(lib, home, code=1, fsize=1 << 20)
+        self.assertFalse((home / 'host_run.txt').exists())   # the game was not started
+        self.assertIn('could not be brought', (home / 'alert.txt').read_text())
+        self.assertFalse((lib / 'save' / TID).exists() and any((lib / 'save' / TID).iterdir()))   # nothing half-copied in place
+        self.assertFalse((lib / 'save' / f'{TID}.migrating').exists())
+        r = self.run_in_library(lib, home)
+        self.assertEqual(r['DM_SAVE'], str(lib / 'save' / TID))
+        self.assertEqual(sorted(p.name for p in (lib / 'save' / TID).iterdir()), ['large.bin', 'small.bin'])
+        self.assertEqual((lib / 'save' / TID / 'large.bin').stat().st_size, 2 << 20)
 
     def test_sigterm(self):   # forwarded to the host, whose exit code comes back
         p = self.launch(wait=True)
