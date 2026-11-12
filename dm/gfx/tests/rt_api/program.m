@@ -39,6 +39,9 @@ static NvProg *serial_get(uint64_t serial) { return serials[@(serial)]; }
 static int mtl_addr_known(uint64_t a, uint64_t n) { (void)a; (void)n; return 1; }
 #define DM_GAME_SHADER_KEY_SKIP_LEN 0
 #define DM_GAME_SHADER_KEY_SKIP_OFF 0
+// The production shader key reads its skipped control bytes from the runtime profile (hle_profile.h): the compiled defaults, none skipped
+#include "../../host/hle_profile.h"
+const struct dm_profile *dm_profile(void) { static const struct dm_profile p; return &p; }
 /* PRODUCTION_SHADER_KEY */
 #include "nvn_raytrace_program.inc"
 
