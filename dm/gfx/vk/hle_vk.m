@@ -181,7 +181,7 @@ static id<MTLSamplerState> ab_sampler_fail(void) {
     id<MTLSamplerState> result = _argumentState; pthread_mutex_unlock(&g_ab_sampler_mu); return result;
 }
 - (void)dealloc {
-    if (_argumentState) { pthread_mutex_lock(&g_ab_sampler_mu); g_ab_sampler_count--; pthread_mutex_unlock(&g_ab_sampler_mu); }
+    if (_argumentState) { pthread_mutex_lock(&g_ab_sampler_mu); if (g_ab_sampler_count) g_ab_sampler_count--; pthread_mutex_unlock(&g_ab_sampler_mu); }
 }
 @end
 
@@ -394,6 +394,39 @@ struct VkCommandBuffer_T { void *loader; VkCommandPool pool; struct VkCommandBuf
 struct VkSwapchainKHR_T { uint32_t n, next; VkImage img[4]; uint64_t ticket[4]; };
 
 static void *zalloc(size_t n) { void *p = calloc(1, n); if (!p) die("[vk] out of memory %zu", n); return p; }
+static pthread_mutex_t g_vk_live_mu = PTHREAD_MUTEX_INITIALIZER;
+static CFMutableDictionaryRef g_vk_live;
+static void vk_live_add(void *p, void (*dtor)(void *)) {
+    if (!p) return;
+    pthread_mutex_lock(&g_vk_live_mu);
+    if (!g_vk_live) g_vk_live = CFDictionaryCreateMutable(NULL, 0, NULL, NULL);
+    CFDictionarySetValue(g_vk_live, p, (const void *)(uintptr_t)dtor);
+    pthread_mutex_unlock(&g_vk_live_mu);
+}
+static int vk_live_del(void *p) {
+    if (!p) return 0;
+    pthread_mutex_lock(&g_vk_live_mu);
+    int had = g_vk_live && CFDictionaryContainsKey(g_vk_live, p);
+    if (had) CFDictionaryRemoveValue(g_vk_live, p);
+    pthread_mutex_unlock(&g_vk_live_mu);
+    return had;
+}
+static void dtor_mem(void *p) { VkDeviceMemory m = p; m->buf = nil; free(m); }
+static void dtor_bview(void *p) { VkBufferView v = p; v->tex = nil; free(v); }
+static void dtor_img(void *p) { VkImage im = p; im->tex = nil; free(im->shadow); free(im); }
+static void dtor_iview(void *p) { VkImageView v = p; v->tex = nil; free(v); }
+static void dtor_samp(void *p) { VkSampler s = p; s->s = nil; s->ref = nil; free(s); }
+static void dtor_shmod(void *p) { VkShaderModule m = p; m->fn = m->fn_d = nil; free(m); }
+static void dsl_put(VkDescriptorSetLayout L);
+static void dtor_dsl(void *p) { dsl_put(p); }
+static void dtor_pipe(void *p) {
+    VkPipeline pl = p;
+    pl->pso = nil; pl->dss = nil; pl->cpso = nil; pl->dss_dyn = nil; ab_free(pl);
+    for (uint32_t i = 0; i < pl->nset; i++) dsl_put(pl->set[i]);
+    if (pl->nviewport > 1) { free(pl->vp); free(pl->sc); }
+    free(pl);
+}
+static void dtor_swap(void *p) { VkSwapchainKHR sc = p; for (uint32_t i = 0; i < sc->n; i++) if (sc->img[i]) { mtl_ext_tex_release(sc->img[i]->serial); sc->img[i]->tex = nil; free(sc->img[i]); } free(sc); }
 
 // ---------- Instance and physical device ----------
 static VkResult fill_names(const char *const *names, uint32_t n, uint32_t *count, VkExtensionProperties *p) {
@@ -643,13 +676,14 @@ VK(vkAllocateMemory, VkResult, VkDevice d, const VkMemoryAllocateInfo *ai, const
     (void)d; (void)a;
     if (ai->memoryTypeIndex >= 3) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
     VkDeviceMemory m = zalloc(sizeof *m); m->size = ai->allocationSize; m->type = ai->memoryTypeIndex;
+    vk_live_add(m, dtor_mem);
     OLOG("AllocateMemory %p %llu bytes type %u", (void *)m, (unsigned long long)m->size, m->type);
     *out = m; return VK_SUCCESS;
 }
 VKB(vkFreeMemory, void, VkDevice d, VkDeviceMemory m, const VkAllocationCallbacks *a) {
-    (void)d; (void)a; if (!m) return;
+    (void)d; (void)a; if (!m || !vk_live_del(m)) return;
     if (m->buf) g_mem_bytes -= m->size;
-    m->buf = nil; free(m);
+    dtor_mem(m);
 }
 VKB(vkMapMemory, VkResult, VkDevice d, VkDeviceMemory m, VkDeviceSize off, VkDeviceSize size, VkMemoryMapFlags fl, void **pp) {
     (void)d; (void)size; (void)fl;
@@ -681,9 +715,10 @@ VKB(vkBindBufferMemory2, VkResult, VkDevice d, uint32_t n, const VkBindBufferMem
 VK(vkCreateBufferView, VkResult, VkDevice d, const VkBufferViewCreateInfo *ci, const VkAllocationCallbacks *a, VkBufferView *out) {
     (void)d; (void)a; VkBufferView v = zalloc(sizeof *v); v->buf = ci->buffer; v->f = fmt_of(ci->format); v->off = ci->offset; v->range = ci->range;
     if (!v->f || v->f->pf == MTLPixelFormatInvalid) RED1("buffer view format %d not mapped", ci->format);
+    vk_live_add(v, dtor_bview);
     *out = v; return VK_SUCCESS;
 }
-VK(vkDestroyBufferView, void, VkDevice d, VkBufferView v, const VkAllocationCallbacks *a) { (void)d; (void)a; if (v) { v->tex = nil; free(v); } }
+VK(vkDestroyBufferView, void, VkDevice d, VkBufferView v, const VkAllocationCallbacks *a) { (void)d; (void)a; if (v && vk_live_del(v)) dtor_bview(v); }
 static id<MTLTexture> bview_tex(VkBufferView v) {   // texel buffer as a linear texture over the buffer's storage, made at first use
     if (v->tex || !v->f || v->f->pf == MTLPixelFormatInvalid || !v->buf->mem) return v->tex;
     VkDeviceSize range = v->range == VK_WHOLE_SIZE ? v->buf->size - v->off : v->range, n = range / v->f->bytes;
@@ -735,8 +770,8 @@ static void conv_unpack(VkImage im, const uint8_t *src, uint8_t *dst) {   // one
     }
 }
 // Before a submit: every converted linear image whose memory changed since it was last unpacked is unpacked again (the textures are small: N64 textures)
+static uint8_t *g_conv_tmp; static size_t g_conv_tcap;
 static void conv_sync(void) {
-    static uint8_t *tmp; static size_t tcap;
     pthread_mutex_lock(&g_convmu);
     for (size_t i = 0; i < g_nconv; i++) {
         VkImage im = g_conv[i]; id<MTLBuffer> b = mem_buf(im->cmem); if (!b || !im->tex) continue;
@@ -745,9 +780,9 @@ static void conv_sync(void) {
         memcpy(im->shadow, src, im->size);
         uint32_t ob = im->f->conv == CV_R4G4 ? 2 : 4; size_t need = (size_t)im->w * im->h * ob;
         if (!need) continue;
-        if (need > tcap) { uint8_t *n = realloc(tmp, need); if (!n) die("[vk] out of memory %zu", need); tmp = n; tcap = need; }
-        conv_unpack(im, im->shadow, tmp);
-        [im->tex replaceRegion:MTLRegionMake2D(0, 0, im->w, im->h) mipmapLevel:0 withBytes:tmp bytesPerRow:(NSUInteger)im->w * ob];
+        if (need > g_conv_tcap) { uint8_t *n = realloc(g_conv_tmp, need); if (!n) die("[vk] out of memory %zu", need); g_conv_tmp = n; g_conv_tcap = need; }
+        conv_unpack(im, im->shadow, g_conv_tmp);
+        [im->tex replaceRegion:MTLRegionMake2D(0, 0, im->w, im->h) mipmapLevel:0 withBytes:g_conv_tmp bytesPerRow:(NSUInteger)im->w * ob];
     }
     pthread_mutex_unlock(&g_convmu);
 }
@@ -762,6 +797,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         VkImage im = zalloc(sizeof *im);
         im->f = f; im->fmt = ci->format; im->type = ci->imageType; im->w = ci->extent.width; im->h = umax(1, ci->extent.height); im->d = im->mips = im->layers = im->samples = 1;
         im->usage = ci->usage; im->pitch = (uint32_t)(((NSUInteger)im->w * f->bytes + al - 1) / al * al); im->size = (VkDeviceSize)im->pitch * im->h;
+        vk_live_add(im, dtor_img);
         OLOG("CreateImage %p %ux%u format %d linear (pitch %u) usage %#x", (void *)im, im->w, im->h, ci->format, im->pitch, ci->usage);
         *out = im; return VK_SUCCESS;
     }
@@ -794,6 +830,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
         im->tex = t; im->f = f; im->fmt = ci->format; im->type = ci->imageType; im->w = (uint32_t)td.width; im->h = (uint32_t)td.height; im->d = (uint32_t)td.depth;
         im->usage = ci->usage;
         im->mips = (uint32_t)td.mipmapLevelCount; im->layers = layers; im->samples = samples; im->size = img_bytes(f, im->w, im->h, im->d, im->mips, layers, samples);
+        vk_live_add(im, dtor_img);
         OLOG("CreateImage %p %ux%ux%u format %d levels %u layers %u usage %#x", (void *)im, im->w, im->h, im->d, ci->format, im->mips, layers, ci->usage);
         *out = im;
     }
@@ -801,7 +838,7 @@ VKB(vkCreateImage, VkResult, VkDevice d, const VkImageCreateInfo *ci, const VkAl
 }
 // A swap chain's image is not the game's to destroy, but Super Mario 3D All-Stars' Super Mario 64 destroys the images vkGetSwapchainImagesKHR gave it as it tears down (main+0x9500) and keeps the
 // swap chain, as the console's driver lets it: ignored, or the swap chain would go on using freed memory
-VKB(vkDestroyImage, void, VkDevice d, VkImage im, const VkAllocationCallbacks *a) { (void)d; (void)a; if (im && im->swap) return; if (im) { if (im->shadow) conv_remove(im); im->tex = nil; free(im->shadow); free(im); } }
+VKB(vkDestroyImage, void, VkDevice d, VkImage im, const VkAllocationCallbacks *a) { (void)d; (void)a; if (im && im->swap) return; if (im && vk_live_del(im)) { if (im->shadow) conv_remove(im); dtor_img(im); } }
 VK(vkGetImageMemoryRequirements, void, VkDevice d, VkImage im, VkMemoryRequirements *r) {
     (void)d; r->alignment = 4096; r->size = (im->size + 4095) & ~4095ull; r->memoryTypeBits = 7;
 }
@@ -882,9 +919,10 @@ VKB(vkCreateImageView, VkResult, VkDevice d, const VkImageViewCreateInfo *ci, co
                                                   slices:NSMakeRange(tt == MTLTextureType3D ? 0 : r->baseArrayLayer, tt == MTLTextureType3D ? 1 : ly) swizzle:sw];
         if (!v->tex) LOG("[vk] [RED] cannot create image view: format %d → %lu type %lu levels %u+%u layers %u+%u", im->fmt, (unsigned long)pf, (unsigned long)tt, r->baseMipLevel, lv, r->baseArrayLayer, ly);
     }
+    vk_live_add(v, dtor_iview);
     *out = v; return VK_SUCCESS;
 }
-VKB(vkDestroyImageView, void, VkDevice d, VkImageView v, const VkAllocationCallbacks *a) { (void)d; (void)a; if (v) { v->tex = nil; free(v); } }
+VKB(vkDestroyImageView, void, VkDevice d, VkImageView v, const VkAllocationCallbacks *a) { (void)d; (void)a; if (v && vk_live_del(v)) dtor_iview(v); }
 
 static MTLSamplerAddressMode addr_mode(VkSamplerAddressMode m) {
     switch (m) {
@@ -913,14 +951,12 @@ VKB(vkCreateSampler, VkResult, VkDevice d, const VkSamplerCreateInfo *ci, const 
         VkSampler s = zalloc(sizeof *s); s->ref = [VkSamplerMetal new]; s->ref.descriptor = [sd copy];
         s->s = [g_dev newSamplerStateWithDescriptor:sd]; s->ref.state = s->s;
         if (!s->s) LOG("[vk] [RED] cannot create the sampler");
+        vk_live_add(s, dtor_samp);
         *out = s;
     }
     return VK_SUCCESS;
 }
-VKB(vkDestroySampler, void, VkDevice d, VkSampler s, const VkAllocationCallbacks *a) {
-    (void)d; (void)a;
-    if (s) { s->s = nil; s->ref = nil; free(s); }
-}
+VKB(vkDestroySampler, void, VkDevice d, VkSampler s, const VkAllocationCallbacks *a) { (void)d; (void)a; if (s && vk_live_del(s)) dtor_samp(s); }
 
 // ---------- Descriptor sets ----------
 static int is_dyn(VkDescriptorType t) { return t == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC || t == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC; }
@@ -953,6 +989,7 @@ VK(vkCreateDescriptorSetLayout, VkResult, VkDevice d, const VkDescriptorSetLayou
         }
     }
     if (L->ndyn > 16) LOG("[vk] [RED] %u dynamic offsets in one set, over 16", L->ndyn);
+    vk_live_add(L, dtor_dsl);
     *out = L; return VK_SUCCESS;
 }
 static void dsl_put(VkDescriptorSetLayout L) {
@@ -960,7 +997,7 @@ static void dsl_put(VkDescriptorSetLayout L) {
     if (L->imm) for (uint32_t i = 0; i < L->total; i++) L->imm[i] = nil;
     free(L->imm); free(L);
 }
-VK(vkDestroyDescriptorSetLayout, void, VkDevice d, VkDescriptorSetLayout L, const VkAllocationCallbacks *a) { (void)d; (void)a; dsl_put(L); }   // sets allocated from it keep it (refs)
+VK(vkDestroyDescriptorSetLayout, void, VkDevice d, VkDescriptorSetLayout L, const VkAllocationCallbacks *a) { (void)d; (void)a; if (L && vk_live_del(L)) dsl_put(L); }   // sets allocated from it keep it (refs)
 VK(vkCreateDescriptorPool, VkResult, VkDevice d, const VkDescriptorPoolCreateInfo *ci, const VkAllocationCallbacks *a, VkDescriptorPool *out) {
     (void)d; (void)ci; (void)a; *out = zalloc(sizeof **out); return VK_SUCCESS;
 }
@@ -1129,9 +1166,10 @@ VKB(vkCreateShaderModule, VkResult, VkDevice d, const VkShaderModuleCreateInfo *
     }
     if (!m->fn && !(m->si && m->si->geom_vp)) LOG("[vk] [RED] shader %s (%zu bytes of SPIR-V) is not in the library", m->key, ci->codeSize);
     else OLOG("CreateShaderModule %s", m->key);
+    vk_live_add(m, dtor_shmod);
     *out = m; return VK_SUCCESS;
 }
-VKB(vkDestroyShaderModule, void, VkDevice d, VkShaderModule m, const VkAllocationCallbacks *a) { (void)d; (void)a; if (m) { m->fn = m->fn_d = nil; free(m); } }
+VKB(vkDestroyShaderModule, void, VkDevice d, VkShaderModule m, const VkAllocationCallbacks *a) { (void)d; (void)a; if (m && vk_live_del(m)) dtor_shmod(m); }
 // Pipeline caches hold nothing: the game's initial data is NVIDIA's binary cache (Super Mario Galaxy's data/database/vulkan/*.cache), and Metal keeps its own
 VK(vkCreatePipelineCache, VkResult, VkDevice d, const VkPipelineCacheCreateInfo *ci, const VkAllocationCallbacks *a, VkPipelineCache *out) {
     (void)d; (void)ci; (void)a; *out = zalloc(sizeof **out); return VK_SUCCESS;
@@ -1353,7 +1391,7 @@ static VkPipeline pipe_make(const VkGraphicsPipelineCreateInfo *ci) {
 }
 VKB(vkCreateGraphicsPipelines, VkResult, VkDevice d, VkPipelineCache c, uint32_t n, const VkGraphicsPipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
     (void)d; (void)c; (void)a; dev_init();
-    for (uint32_t i = 0; i < n; i++) out[i] = pipe_make(&ci[i]);   // a pipeline Metal refuses is still handed out: its draws are skipped
+    for (uint32_t i = 0; i < n; i++) { out[i] = pipe_make(&ci[i]); vk_live_add(out[i], dtor_pipe); }   // a pipeline Metal refuses is still handed out: its draws are skipped
     return VK_SUCCESS;
 }
 // A compute pipeline uses the shader's full local size; reducing it would change gl_LocalInvocationID.
@@ -1380,23 +1418,16 @@ static VkPipeline cpipe_make(const VkComputePipelineCreateInfo *ci) {
             p->cpso = nil; return p;
         }
         if (!ab_init(p, ST_COMP, fn, p->cs)) { p->cpso = nil; ab_free(p); LOG("[vk] [RED] compute pipeline %s refused: argument-buffer initialization failed", m->key); return p; }
-        g_n_pso++; OLOG("compute pipeline %s, local size %lux%lux%lu", m->key, (unsigned long)p->wg.width, (unsigned long)p->wg.height, (unsigned long)p->wg.depth);
+        g_n_pso++; OLOG("compute pipeline %s, local size %lux%lux%lu", m->key, (unsigned long)p->wg.width, (unsigned long)p->wg.height, (unsigned long)p->cpso.maxTotalThreadsPerThreadgroup);
     }
     return p;
 }
 VKB(vkCreateComputePipelines, VkResult, VkDevice d, VkPipelineCache c, uint32_t n, const VkComputePipelineCreateInfo *ci, const VkAllocationCallbacks *a, VkPipeline *out) {
     (void)d; (void)c; (void)a; dev_init();
-    for (uint32_t i = 0; i < n; i++) out[i] = cpipe_make(&ci[i]);   // as for graphics: a pipeline Metal refuses is handed out, and its dispatches are skipped
+    for (uint32_t i = 0; i < n; i++) { out[i] = cpipe_make(&ci[i]); vk_live_add(out[i], dtor_pipe); }   // as for graphics: a pipeline Metal refuses is handed out, and its dispatches are skipped
     return VK_SUCCESS;
 }
-VKB(vkDestroyPipeline, void, VkDevice d, VkPipeline p, const VkAllocationCallbacks *a) {
-    (void)d; (void)a;
-    if (!p) return;
-    p->pso = nil; p->dss = nil; p->cpso = nil; p->dss_dyn = nil; ab_free(p);
-    for (uint32_t i = 0; i < p->nset; i++) dsl_put(p->set[i]);
-    if (p->nviewport > 1) { free(p->vp); free(p->sc); }
-    free(p);
-}
+VKB(vkDestroyPipeline, void, VkDevice d, VkPipeline p, const VkAllocationCallbacks *a) { (void)d; (void)a; if (p && vk_live_del(p)) dtor_pipe(p); }
 
 // ---------- Command buffers: recording ----------
 enum { C_BRP = 1, C_ERP, C_PIPE, C_SETS, C_VB, C_IB, C_VP, C_SC, C_DRAWI, C_COPYB, C_COPYB2I, C_DRAW, C_PUSH, C_COPYI, C_COPYI2B, C_QRESET, C_QTS, C_QBEGIN, C_QEND, C_CLEARI, C_STENCIL,
@@ -2012,26 +2043,27 @@ static int fan_scan_passes(uint32_t op) {   // commands that never end a render 
     }
     return 0;
 }
+static id<MTLComputePipelineState> g_fan_ps;
+static int g_fan_failed;
 static id<MTLBuffer> fan_convert(id<MTLCommandBuffer> cb, const fan_job *jobs, uint32_t n, uint64_t size) {
     if (!n) return nil;
-    static id<MTLComputePipelineState> ps; static int failed;
-    if (!ps && !failed) {
+    if (!g_fan_ps && !g_fan_failed) {   // the host shader library is compiled at build time, like the NVN layer's own kernels
         NSError *e = nil; id<MTLLibrary> lib = host_msl_lib(g_dev, nil, "vk_fan", &e);
         id<MTLFunction> fn = [lib newFunctionWithName:@"vk_fan"];
-        ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
-        if (!ps) { failed = 1; LOG("[vk] [RED] cannot build the triangle fan conversion (indexed fans are not drawn): %s", e.localizedDescription.UTF8String); }
+        g_fan_ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&e] : nil;
+        if (!g_fan_ps) { g_fan_failed = 1; LOG("[vk] [RED] cannot build the triangle fan conversion (indexed fans are not drawn): %s", e.localizedDescription.UTF8String); }
     }
-    if (!ps) return nil;
+    if (!g_fan_ps) return nil;
     id<MTLBuffer> out = size <= g_dev.maxBufferLength ? [g_dev newBufferWithLength:size options:MTLResourceStorageModeShared] : nil;
     if (!out) { RED1("cannot allocate triangle fan indices (%llu bytes)", (unsigned long long)size); return nil; }
     id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-    [ce setComputePipelineState:ps];
+    [ce setComputePipelineState:g_fan_ps];
     for (uint32_t i = 0; i < n; i++) {
         const fan_job *j = &jobs[i];
         [ce setBuffer:mem_buf(j->ib->mem) offset:0 atIndex:0]; [ce setBuffer:out offset:j->at + 32 atIndex:1]; [ce setBuffer:out offset:j->at atIndex:2];
         [ce setBytes:&j->p length:sizeof j->p atIndex:3];
         NSUInteger threads = j->p.restart ? 1 : j->p.count - 2;   // restart compacts the runs without crossing a marker
-        [ce dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(threads, ps.threadExecutionWidth), 1, 1)];
+        [ce dispatchThreads:MTLSizeMake(threads, 1, 1) threadsPerThreadgroup:MTLSizeMake(MIN(threads, g_fan_ps.threadExecutionWidth), 1, 1)];
     }
     [ce endEncoding];
     return out;
@@ -2180,25 +2212,25 @@ static const char transfer_msl[] =
     "fragment uint4 resolve_uint(V v [[stage_in]], texture2d_ms<uint> t [[texture(0)]]) { return t.read(pixel_coord(v.uv,uint2(t.get_width(),t.get_height())),0u); }\n"
     "fragment int4 resolve_int(V v [[stage_in]], texture2d_ms<int> t [[texture(0)]]) { return t.read(pixel_coord(v.uv,uint2(t.get_width(),t.get_height())),0u); }\n";
 enum { BLIT_FLOAT, BLIT_UINT, BLIT_INT, RESOLVE_UINT, RESOLVE_INT };
+static id<MTLLibrary> g_vk_transfer_lib;
+static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *g_vk_transfer_psos;
 static id<MTLRenderPipelineState> transfer_pso(MTLPixelFormat format, int variant) {
-    static id<MTLLibrary> lib;
-    static NSMutableDictionary<NSNumber *, id<MTLRenderPipelineState>> *psos;
     static NSString *const fn[] = {@"blit_float", @"blit_uint", @"blit_int", @"resolve_uint", @"resolve_int"};
     NSNumber *key = @((NSUInteger)format * 8 + variant);
-    id<MTLRenderPipelineState> p = psos[key];   // replay is serial under g_qmu
+    id<MTLRenderPipelineState> p = g_vk_transfer_psos[key];   // replay is serial under g_qmu
     if (p) return p;
     NSError *err = nil;
-    if (!lib) lib = [g_dev newLibraryWithSource:@(transfer_msl) options:nil error:&err];
-    if (lib) {
+    if (!g_vk_transfer_lib) g_vk_transfer_lib = [g_dev newLibraryWithSource:@(transfer_msl) options:nil error:&err];
+    if (g_vk_transfer_lib) {
         MTLRenderPipelineDescriptor *d = [MTLRenderPipelineDescriptor new];
-        d.vertexFunction = [lib newFunctionWithName:@"blit_vs"];
-        d.fragmentFunction = [lib newFunctionWithName:fn[variant]];
+        d.vertexFunction = [g_vk_transfer_lib newFunctionWithName:@"blit_vs"];
+        d.fragmentFunction = [g_vk_transfer_lib newFunctionWithName:fn[variant]];
         d.colorAttachments[0].pixelFormat = format;
         p = [g_dev newRenderPipelineStateWithDescriptor:d error:&err];
     }
     if (!p) { LOG("[vk] [RED] image transfer pipeline for format %lu: %s", (unsigned long)format, err.localizedDescription.UTF8String); return nil; }
-    if (!psos) psos = [NSMutableDictionary new];
-    psos[key] = p;
+    if (!g_vk_transfer_psos) g_vk_transfer_psos = [NSMutableDictionary new];
+    g_vk_transfer_psos[key] = p;
     return p;
 }
 
@@ -2206,6 +2238,7 @@ static id<MTLTexture> transfer_view(id<MTLTexture> tex, NSUInteger level, NSUInt
     if (tex.textureType == type && tex.mipmapLevelCount == 1) return tex;
     return [tex newTextureViewWithPixelFormat:tex.pixelFormat textureType:type levels:NSMakeRange(level, 1) slices:NSMakeRange(layer, 1)];
 }
+static id<MTLSamplerState> g_vk_transfer_samp[2];
 static void draw_transfer(rs_t *s, id<MTLTexture> src, id<MTLTexture> dst, uint32_t mip, uint32_t layer,
                           VkOffset3D a, VkOffset3D b, MTLViewport vp, int variant, VkFilter filter) {
     id<MTLRenderPipelineState> pso = transfer_pso(dst.pixelFormat, variant);
@@ -2219,14 +2252,13 @@ static void draw_transfer(rs_t *s, id<MTLTexture> src, id<MTLTexture> dst, uint3
     id<MTLRenderCommandEncoder> e = [s->cb renderCommandEncoderWithDescriptor:d];
     [e setRenderPipelineState:pso]; [e setViewport:vp]; [e setVertexBytes:uv length:sizeof uv atIndex:0]; [e setFragmentTexture:src atIndex:0];
     if (variant == BLIT_FLOAT) {
-        static id<MTLSamplerState> samplers[2];
         int linear = filter == VK_FILTER_LINEAR;
-        if (!samplers[linear]) {
+        if (!g_vk_transfer_samp[linear]) {
             MTLSamplerDescriptor *sd = [MTLSamplerDescriptor new];
             sd.minFilter = sd.magFilter = linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-            samplers[linear] = [g_dev newSamplerStateWithDescriptor:sd];
+            g_vk_transfer_samp[linear] = [g_dev newSamplerStateWithDescriptor:sd];
         }
-        [e setFragmentSamplerState:samplers[linear] atIndex:0];
+        [e setFragmentSamplerState:g_vk_transfer_samp[linear] atIndex:0];
     }
     [e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4]; [e endEncoding]; g_n_copy++;
 }
@@ -2335,39 +2367,40 @@ static int clear_covers_attachment(MTLRenderPassAttachmentDescriptor *a, const V
 // separate load/store pass for each selected view layer. The game's encoder resumes through reopen_rp, restoring its bindings and allocating a new occlusion-query slot.
 // Helper passes have no visibility buffer: Vulkan permits clears to contribute to occlusion queries, but does not require them to do so.
 typedef struct { uint32_t color, depth, stencil, samples, kind; } attachment_clear_key;
+static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *g_vk_aclr_cache;
+static id<MTLLibrary> g_vk_aclr_lib;
+static int g_vk_aclr_failed;
 static id<MTLRenderPipelineState> attachment_clear_pso(MTLRenderPassDescriptor *d, const fmt_t *f) {
     id<MTLTexture> color = d.colorAttachments[0].texture, depth = d.depthAttachment.texture, stencil = d.stencilAttachment.texture;
     id<MTLTexture> t = color ?: depth ?: stencil;
     attachment_clear_key k = {(uint32_t)color.pixelFormat, (uint32_t)depth.pixelFormat, (uint32_t)stencil.pixelFormat, (uint32_t)t.sampleCount,
         f && f->kind == K_INT ? (fmt_is_signed_int(f) ? 2u : 1u) : 0u};
-    static NSMutableDictionary<NSData *, id<MTLRenderPipelineState>> *cache;
-    NSData *key = [NSData dataWithBytes:&k length:sizeof k]; id<MTLRenderPipelineState> pso = cache[key]; if (pso) return pso;
-    static id<MTLLibrary> lib; static int failed;
-    if (failed) return nil;
+    NSData *key = [NSData dataWithBytes:&k length:sizeof k]; id<MTLRenderPipelineState> pso = g_vk_aclr_cache[key]; if (pso) return pso;
+    if (g_vk_aclr_failed) return nil;
     NSError *e = nil;
-    if (!lib) lib = host_msl_lib(g_dev, nil, "clear", &e);
-    if (!lib) { failed = 1; LOG("[vk] [RED] attachment clear shaders: %s", e.localizedDescription.UTF8String); return nil; }
+    if (!g_vk_aclr_lib) g_vk_aclr_lib = host_msl_lib(g_dev, nil, "clear", &e);
+    if (!g_vk_aclr_lib) { g_vk_aclr_failed = 1; LOG("[vk] [RED] attachment clear shaders: %s", e.localizedDescription.UTF8String); return nil; }
     MTLRenderPipelineDescriptor *p = [MTLRenderPipelineDescriptor new];
-    p.vertexFunction = [lib newFunctionWithName:@"clr_vs"];
+    p.vertexFunction = [g_vk_aclr_lib newFunctionWithName:@"clr_vs"];
     if (color) {
         static const char *types[] = {"float", "uint", "int"};
-        p.fragmentFunction = [lib newFunctionWithName:[NSString stringWithFormat:@"clr_fs_0_%s", types[k.kind]]];
+        p.fragmentFunction = [g_vk_aclr_lib newFunctionWithName:[NSString stringWithFormat:@"clr_fs_0_%s", types[k.kind]]];
         p.colorAttachments[0].pixelFormat = color.pixelFormat;
     }
     p.depthAttachmentPixelFormat = depth.pixelFormat; p.stencilAttachmentPixelFormat = stencil.pixelFormat; p.rasterSampleCount = t.sampleCount;
     pso = [g_dev newRenderPipelineStateWithDescriptor:p error:&e];
     if (!pso) { LOG("[vk] [RED] attachment clear pipeline (%u/%u/%u, %u samples): %s", k.color, k.depth, k.stencil, k.samples, e.localizedDescription.UTF8String); return nil; }
-    if (!cache) cache = [NSMutableDictionary new]; cache[key] = pso; return pso;
+    if (!g_vk_aclr_cache) g_vk_aclr_cache = [NSMutableDictionary new]; g_vk_aclr_cache[key] = pso; return pso;
 }
+static id<MTLDepthStencilState> g_vk_aclr_dss[2][2];
 static id<MTLDepthStencilState> attachment_clear_dss(int depth, int stencil) {
-    static id<MTLDepthStencilState> cache[2][2];
-    if (cache[depth][stencil]) return cache[depth][stencil];
+    if (g_vk_aclr_dss[depth][stencil]) return g_vk_aclr_dss[depth][stencil];
     MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new]; d.depthCompareFunction = MTLCompareFunctionAlways; d.depthWriteEnabled = depth;
     if (stencil) {
         MTLStencilDescriptor *st = [MTLStencilDescriptor new]; st.stencilCompareFunction = MTLCompareFunctionAlways; st.depthStencilPassOperation = MTLStencilOperationReplace;
         st.writeMask = 0xff; d.frontFaceStencil = d.backFaceStencil = st;
     }
-    return cache[depth][stencil] = [g_dev newDepthStencilStateWithDescriptor:d];
+    return g_vk_aclr_dss[depth][stencil] = [g_dev newDepthStencilStateWithDescriptor:d];
 }
 static void attachment_clear_layer(MTLRenderPassAttachmentDescriptor *dst, MTLRenderPassAttachmentDescriptor *src, uint32_t layer) {
     dst.texture = src.texture; dst.level = src.level;
@@ -2791,10 +2824,18 @@ VK(vkQueueBindSparse, VkResult, VkQueue q, uint32_t n, const VkBindSparseInfo *b
     if (f) atomic_store(&f->val, 0);
     return n ? VK_ERROR_FEATURE_NOT_PRESENT : VK_SUCCESS;
 }
+void dm_vk_wake_teardown(void) {
+    pthread_mutex_lock(&g_done_mu);
+    pthread_cond_broadcast(&g_done_cv);
+    pthread_mutex_unlock(&g_done_mu);
+}
 static void wait_done(uint64_t v) {
     pthread_mutex_lock(&g_done_mu);
-    while (atomic_load(&g_done) < v) pthread_cond_wait(&g_done_cv, &g_done_mu);
+    while (atomic_load(&g_done) < v && !dm_teardown_is_parking())
+        pthread_cond_wait(&g_done_cv, &g_done_mu);
+    int parking = atomic_load(&g_done) < v && dm_teardown_is_parking();
     pthread_mutex_unlock(&g_done_mu);
+    if (parking) dm_teardown_check_current_thread();
 }
 void dm_vk_drain(void) { pthread_mutex_lock(&g_qmu); uint64_t v = g_ev_val; pthread_mutex_unlock(&g_qmu); wait_done(v); }   // dm_gfx_suspend (hle_nvn.c)
 VKB(vkQueueWaitIdle, VkResult, VkQueue q) { (void)q; pthread_mutex_lock(&g_qmu); uint64_t v = g_ev_val; pthread_mutex_unlock(&g_qmu); wait_done(v); return VK_SUCCESS; }
@@ -2809,6 +2850,11 @@ VKB(vkWaitForFences, VkResult, VkDevice d, uint32_t n, const VkFence *fs, VkBool
     (void)d; uint64_t t0 = now_ns(); int warned = 0;
     pthread_mutex_lock(&g_done_mu);
     for (;;) {
+        if (dm_teardown_is_parking()) {
+            pthread_mutex_unlock(&g_done_mu);
+            dm_teardown_check_current_thread();
+            return VK_TIMEOUT;
+        }
         uint32_t k = 0; for (uint32_t i = 0; i < n; i++) k += fence_done(fs[i]);
         if (all ? k == n : k > 0) { pthread_mutex_unlock(&g_done_mu); return VK_SUCCESS; }
         uint64_t el = now_ns() - t0;
@@ -2865,15 +2911,14 @@ VKB(vkCreateSwapchainKHR, VkResult, VkDevice d, const VkSwapchainCreateInfoKHR *
             sc->img[i] = im;
         }
     }
+    vk_live_add(sc, dtor_swap);
     VLOG("swap chain %ux%u format %d, %u images (at least %u requested), present mode %d", ci->imageExtent.width, ci->imageExtent.height, ci->imageFormat, sc->n, ci->minImageCount, ci->presentMode);
     *out = sc; return VK_SUCCESS;
 }
 VKB(vkDestroySwapchainKHR, void, VkDevice d, VkSwapchainKHR sc, const VkAllocationCallbacks *a) {
-    (void)d; (void)a; if (!sc) return;
-    for (uint32_t i = 0; i < sc->n; i++) { if (sc->ticket[i]) mtl_present_wait(sc->ticket[i]); }
-    // The present path keeps each texture until its presents have completed on the GPU, then lets it go (mtl_ext_tex_release); kept for good before, at every recreation
-    for (uint32_t i = 0; i < sc->n; i++) { mtl_ext_tex_release(sc->img[i]->serial); sc->img[i]->tex = nil; free(sc->img[i]); }
-    free(sc);
+    (void)d; (void)a; if (!sc || !vk_live_del(sc)) return;
+    for (uint32_t i = 0; i < sc->n; i++) if (sc->ticket[i]) mtl_present_wait(sc->ticket[i]);
+    dtor_swap(sc);
 }
 VK(vkGetSwapchainImagesKHR, VkResult, VkDevice d, VkSwapchainKHR sc, uint32_t *n, VkImage *out) {
     (void)d; if (!out) { *n = sc->n; return VK_SUCCESS; }
@@ -2941,3 +2986,65 @@ static void *vk_lookup(const char *name) {
 }
 VK(vkGetInstanceProcAddr, PFN_vkVoidFunction, VkInstance i, const char *name) { (void)i; return (PFN_vkVoidFunction)vk_lookup(name); }
 VK(vkGetDeviceProcAddr, PFN_vkVoidFunction, VkDevice d, const char *name) { (void)d; return (PFN_vkVoidFunction)vk_lookup(name); }
+
+static void vk_live_free_cb(const void *key, const void *value, void *context) {
+    (void)context;
+    void (*dtor)(void *) = (void (*)(void *))(uintptr_t)value;
+    if (dtor) dtor((void *)key);
+}
+
+static void vk_set_free_cb(const void *value, void *context) {
+    (void)context;
+    VkDescriptorSet s = (VkDescriptorSet)value;
+    if (!s) return;
+    for (uint32_t k = 0; k < s->L->total; k++) s->d[k] = (desc_t){0};
+    dsl_put(s->L);
+    free(s->d);
+    free(s);
+}
+
+void dm_vk_teardown(void) { @autoreleasepool {
+    if (!g_dev) return;
+    dm_vk_drain();
+
+    pthread_mutex_lock(&g_sets_mu);
+    if (g_sets) {
+        CFSetApplyFunction(g_sets, vk_set_free_cb, NULL);
+        CFRelease(g_sets);
+        g_sets = NULL;
+    }
+    pthread_mutex_unlock(&g_sets_mu);
+
+    pthread_mutex_lock(&g_vk_live_mu);
+    if (g_vk_live) {
+        CFDictionaryApplyFunction(g_vk_live, vk_live_free_cb, NULL);
+        CFRelease(g_vk_live);
+        g_vk_live = NULL;
+    }
+    pthread_mutex_unlock(&g_vk_live_mu);
+
+    pthread_mutex_lock(&g_convmu);
+    free(g_conv); g_conv = NULL; g_nconv = g_capconv = 0;
+    free(g_conv_tmp); g_conv_tmp = NULL; g_conv_tcap = 0;
+    pthread_mutex_unlock(&g_convmu);
+
+    for (int i = 0; i < g_nsh; i++) free(g_sh[i].res);
+    free(g_sh); g_sh = NULL; g_nsh = 0;
+    g_vk_transfer_psos = nil; g_vk_transfer_lib = nil;
+    g_vk_transfer_samp[0] = g_vk_transfer_samp[1] = nil;
+    g_vk_aclr_cache = nil; g_vk_aclr_lib = nil; g_vk_aclr_failed = 0;
+    for (int d = 0; d < 2; d++) for (int s = 0; s < 2; s++) g_vk_aclr_dss[d][s] = nil;
+    g_rw_tex_tier = 0; g_ab_tier = 0; g_ab_sampler_limit = 0;
+    pthread_mutex_lock(&g_ab_sampler_mu); g_ab_sampler_count = 0; pthread_mutex_unlock(&g_ab_sampler_mu);
+    atomic_store(&g_set_gen, 0); g_enc_id = 0;
+    atomic_store(&g_n_disp, 0); atomic_store(&g_n_skip, 0); atomic_store(&g_n_skip_disp, 0); atomic_store(&g_n_comp_enc, 0);
+    g_fan_ib = nil; g_fan_tris = 0;
+    atomic_store(&g_fan_pipes, 0);
+    atomic_store(&g_n_resume, 0);
+    g_fan_ps = nil; g_fan_failed = 0;
+    g_lib = nil;
+    g_dss_off = nil;
+    g_ev = nil;
+    g_q = nil;
+    g_dev = nil;
+} }

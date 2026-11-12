@@ -172,6 +172,19 @@ int main(void) { @autoreleasepool {
         CHECK(tbig && tbig.heap && tbig.heap.size >= nb.size && tbig.heap.size <= nb.size + RH_SLACK + 65536, "a large target's new heap is at most RH_SLACK larger than it");
         tbig = nil; mtl_tex_release(&big); mtl_alias_drop_pool(&pool); settle();
     }
-    mtl_sub_commit(); mtl_drain(); free(mem);
+    {
+        unsigned w0 = waiting();
+        tex_t g = target(&pool, 95009, 0, 1024, 576); mtl_tex_init(&g);
+        id<MTLTexture> tg = tex_mtl(&g);
+        CHECK(tg && tg.heap != nil, "target before teardown gets a heap");
+        tg = nil; mtl_tex_release(&g); mtl_alias_drop_pool(&pool); settle();
+        CHECK(waiting() == w0 + 1, "one more heap waits before dm_gfx_teardown");
+        tex_t h = target(&pool, 95011, 8 << 20, 1600, 900); mtl_tex_init(&h);
+        CHECK(tex_mtl(&h) != nil, "live target exists at dm_gfx_teardown");
+    }
+    mtl_sub_commit(); mtl_drain();
+    dm_gfx_teardown();
+    CHECK(waiting() == 0 && g_rh == NULL && g_rh_bytes == 0, "dm_gfx_teardown frees waiting and live recycled heaps");
+    free(mem);
     printf("t_rt_recycle: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }

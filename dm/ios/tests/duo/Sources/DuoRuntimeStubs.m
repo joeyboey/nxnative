@@ -94,7 +94,7 @@ void dm_motion_clear(int player) {
 }
 
 uint32_t dm_player_npad(int player) { return player == 0 ? 0x20 : (uint32_t)player; }
-int dm_players_reported(void) { return __builtin_popcount(duo_harness_state().connected_players); }
+int dm_players_reported(void) { return __builtin_popcount(duo_harness_state().connected_players | 1u); }
 
 static int g_opmode;   // handheld, until a test or the in-game menu docks it
 int dm_opmode(void) { return g_opmode; }
@@ -131,5 +131,5 @@ const char *front_ios_boot_message(void) { return NULL; }
 const char *front_ios_device_check(void) { return NULL; }   // a supported GPU
 void dm_cloud_saves_env(void) {}
 int save_sync_flush(int timeout_ms) { (void)timeout_ms; return 1; }
-int front_web_touch(void) { return 0; }
+bool front_ios_hud_enabled_from_saved_choice(void) { return false; }
 void dm_host_shutdown(const char *why) { (void)why; }

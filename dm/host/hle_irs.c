@@ -180,3 +180,10 @@ static Result irs_answer(sf_req *r) {
     }
 }
 SF_SERVICE("irs", irs_answer);
+
+void dm_irs_teardown(void) {
+    pthread_mutex_lock(&irs_lock);
+    for (unsigned i = 0; i < IRS_CAMERA_COUNT; i++) hle_unmap_transfer_memory(&irs_cameras[i].transfer);
+    memset(irs_cameras, 0, sizeof irs_cameras);
+    pthread_mutex_unlock(&irs_lock);
+}

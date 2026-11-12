@@ -8,6 +8,7 @@
 #import <Metal/Metal.h>
 #import <AVFAudio/AVFAudio.h>
 #include <errno.h>
+#include <dlfcn.h>
 #include <stdatomic.h>   // g_screen_hz: read on the main thread, used from the render thread (front_screen_max_fps)
 #include "front.h"
 #include "hle.h"
@@ -21,6 +22,8 @@
 
 void dm_gamepad_active(void);
 void dm_gamepad_pads_read(void);
+void dm_host_teardown_for_shell(void);             // hle_lifecycle.c
+typedef void (*dm_shell_return_fn)(void);
 static void quit_close(void);
 #import "DmLayout.h"
 #import "DmGameMenu.h"
@@ -88,6 +91,10 @@ static void tv_attach(void);
 }
 @end
 
+@interface DmTVSceneDelegate : UIResponder <UIWindowSceneDelegate>
+@property (strong, nonatomic) UIWindow *window;
+@end
+
 @interface DmRootVC : UIViewController
 @property (nonatomic, strong) DmGameView *game;
 @property (nonatomic, strong) UIView *pad;
@@ -137,7 +144,7 @@ static void launcher_done(void) { [g_root startGame]; }
 #if defined(__IPHONE_27_0)   // compiled only with an SDK that has the scene accessory API
     if (@available(iOS 27.0, *)) {   // iOS 27 offers a TV scene only to a registered scene accessory, no longer from the Info.plist entry alone (that path stays for iOS 26)
         UISceneConfiguration *c = [[UISceneConfiguration alloc] initWithName:@"TV" sessionRole:UIWindowSceneSessionRoleExternalDisplayNonInteractive];
-        c.delegateClass = NSClassFromString(@"DmTVSceneDelegate");
+        c.delegateClass = DmTVSceneDelegate.class;
         self.tv = [self registerSceneAccessory:[UISceneAccessory externalNonInteractiveSceneAccessoryWithConfiguration:c]];
     }
 #endif
@@ -319,9 +326,6 @@ bool dm_setting_live(const char *env, const char *value) {
     if (!strcmp(env, "DM_RUMBLE")) { if (value) { dm_haptics_set_enabled(atoi(value) != 0); LOG("front end: game rumble %s (in-game menu)", atoi(value) ? "on" : "off"); } return true; }
     return false;
 }
-@interface DmTVSceneDelegate : UIResponder <UIWindowSceneDelegate>
-@property (strong, nonatomic) UIWindow *window;
-@end
 @implementation DmTVSceneDelegate
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)o {
     self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
@@ -335,17 +339,19 @@ bool dm_setting_live(const char *env, const char *value) {
 // Thermal state and screen brightness for the power and present rows every 300 frames (hle_nvn.c; its weak defaults return -1 on the Mac). thermalState: 0 nominal, 1 fair, 2 serious, 3 critical.
 // Brightness is read on the main thread at start and on each change; every change of the thermal state and of Low Power Mode (which lowers the CPU clock) is logged with the time since launch
 static _Atomic double g_brightness = -1;
+static id g_obs[7];   // the notification observers front_ios_teardown removes
+static NSTimer *g_fps_timer;
 int dm_thermal_now(void) { return (int)NSProcessInfo.processInfo.thermalState; }
 int dm_low_power_now(void) { return NSProcessInfo.processInfo.lowPowerModeEnabled; }   // the frame step does not probe in it (hle_nvn.c fstep_cpu_slowed)
 double dm_brightness_now(void) { return g_brightness; }
 static void front_ios_power_watch(void) {
     g_brightness = UIScreen.mainScreen.brightness;
-    [NSNotificationCenter.defaultCenter addObserverForName:UIScreenBrightnessDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; g_brightness = UIScreen.mainScreen.brightness; }];
-    [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
+    g_obs[0] = [NSNotificationCenter.defaultCenter addObserverForName:UIScreenBrightnessDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; g_brightness = UIScreen.mainScreen.brightness; }];
+    g_obs[1] = [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
         (void)n; LOG("front end: thermal state → %d (%.0f s after launch)", dm_thermal_now(), (now_ns() - g_t0_ns) / 1e9); }];
-    [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+    g_obs[2] = [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
         (void)n; LOG("front end: Low Power Mode → %s (%.0f s after launch)", dm_low_power_now() ? "on" : "off", (now_ns() - g_t0_ns) / 1e9); screen_refresh(); }];
-    [NSNotificationCenter.defaultCenter addObserverForName:UIScreenModeDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; screen_refresh(); }];
+    g_obs[5] = [NSNotificationCenter.defaultCenter addObserverForName:UIScreenModeDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; screen_refresh(); }];
     screen_refresh();
     LOG("front end: thermal state %d, brightness %.2f, Low Power Mode %s, screen %d Hz", dm_thermal_now(), g_brightness, dm_low_power_now() ? "on" : "off", front_screen_max_fps());
 }
@@ -360,7 +366,8 @@ static UILabel *front_ios_fps_label(void) {
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
     l.text = @"-- fps";
     __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
-    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
+    [g_fps_timer invalidate];
+    g_fps_timer = [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
         (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime();
         if (now - t0 < 1.5) l.text = [NSString stringWithFormat:@"%.0f fps", (n - n0) / (now - t0)];   // a longer span is the time in the background: no reading
         n0 = n; t0 = now;
@@ -607,7 +614,7 @@ static int g_audio_bg, g_audio_intr;
 static void front_ios_audio_apply(void) { dm_audio_suspend(g_audio_bg || g_audio_intr); }
 static void front_ios_audio_watch(void) {
     NSNotificationCenter *nc = NSNotificationCenter.defaultCenter;
-    [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+    g_obs[3] = [nc addObserverForName:AVAudioSessionInterruptionNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
         NSUInteger type = [n.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue], reason = [n.userInfo[AVAudioSessionInterruptionReasonKey] unsignedIntegerValue];
         if (type == AVAudioSessionInterruptionTypeBegan) { LOG("audio session: interrupted (reason %lu)", (unsigned long)reason); g_audio_intr = 1; }
         else {
@@ -617,13 +624,13 @@ static void front_ios_audio_watch(void) {
         front_ios_audio_apply();
     }];
     // A new output (an HDMI adapter, AirPods, a dock) or one gone: ask for the channels the new route takes, then the host gives each output a unit at that count (dm_audio_route_changed)
-    [nc addObserverForName:AVAudioSessionRouteChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+    g_obs[6] = [nc addObserverForName:AVAudioSessionRouteChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
         NSUInteger reason = [n.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue];
         if (reason == AVAudioSessionRouteChangeReasonCategoryChange) return;   // our own setCategory at activation; the route is the same
         LOG("audio session: route changed (reason %lu)", (unsigned long)reason);
         front_ios_audio_channels(AVAudioSession.sharedInstance); dm_audio_route_changed();
     }];
-    [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+    g_obs[4] = [nc addObserverForName:AVAudioSessionMediaServicesWereResetNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
         (void)n; LOG("audio session: the media services were reset; setting the session and the outputs up again");
         front_ios_audio_session(); dm_audio_reset();
     }];
@@ -643,8 +650,9 @@ static void save_sync_background(void) {
     });
 }
 
+static _Atomic int g_quitting;
 void front_ios_focus_event(int ev) {
-    if (!g_layer) return;
+    if (!g_layer || atomic_load(&g_quitting)) return;
     switch (ev) {
         case 0: quit_close(); dm_movie_active(0); dm_gamepad_reset(); dm_focus_set(2); break;
         case 1: UIApplication.sharedApplication.idleTimerDisabled = NO; dm_focus_set(3); g_audio_bg = 1; front_ios_audio_apply(); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); save_sync_background(); break;
@@ -753,14 +761,60 @@ static void quit_show_prompt(GCController *holder) {
     g_hq_view = v;
     UIAccessibilityPostNotification(UIAccessibilityScreenChangedNotification, v.accessibilityElements.firstObject);
 }
-// The prompt's quit: the cloud saves go out (as when the app goes to the background), then the host ends as on a SIGTERM. Off the main queue: both wait
+void dm_gamepad_teardown(void);
+void front_web_close(void);
+static void front_ios_teardown(void) {
+    front_web_close();
+    dm_gamepad_teardown();
+    [g_fps_timer invalidate]; g_fps_timer = nil;
+    [g_hq_timer invalidate]; g_hq_timer = nil;
+    for (int i = 0; i < (int)(sizeof g_obs / sizeof *g_obs); i++) if (g_obs[i]) { [NSNotificationCenter.defaultCenter removeObserver:g_obs[i]]; g_obs[i] = nil; }
+    g_audio_bg = g_audio_intr = g_session_off = 0;
+    [[AVAudioSession sharedInstance] setActive:NO withOptions:AVAudioSessionSetActiveOptionNotifyOthersOnDeactivation error:nil];
+    if (g_notify_delegate) {
+        UNUserNotificationCenter.currentNotificationCenter.delegate = nil;
+        g_notify_delegate = nil;
+    }
+    [g_prog removeFromSuperview]; g_prog = nil; g_prog_count = nil; g_prog_bar = nil; g_prog_title = nil;
+    [g_hq_view removeFromSuperview]; g_hq_view = nil;
+    [g_hq_hold removeFromSuperlayer]; g_hq_hold = nil; g_hq_ring = nil;
+    if (g_tv) tv_detach();
+    if (g_root) {
+        [g_root.fps removeFromSuperview]; g_root.fps = nil;
+        [g_root.pad removeFromSuperview]; g_root.pad = nil;
+        [g_root.game removeFromSuperview]; g_root.game = nil;
+        g_root.tv = nil;
+        g_root.layoutLog = nil;
+        g_root = nil;
+    }
+    g_layer = nil;
+    atomic_store(&g_quitting, 0);
+}
+// The prompt's quit: the cloud saves go out (as when the app goes to the background), then in the shell the host tears down its threads, GPU resources and 5 GB address space and returns the window to the library, or in a single-game app the host ends as on a SIGTERM. Off the main queue: both wait
 static void quit_now(void) {
-    LOG("front end: quit from the quit prompt, the app closes (one game per process)");
+    if (atomic_exchange(&g_quitting, 1)) return;
+    dm_shell_return_fn shell_return = (dm_shell_return_fn)dlsym(RTLD_DEFAULT, "dm_shell_return_to_library");
+    LOG("front end: quit from the quit prompt, %s", shell_return ? "returning to the shell library" : "the app closes (one game per process)");
     g_hq_view.userInteractionEnabled = NO;
     [CATransaction begin]; [CATransaction setAnimationDuration:0.2]; g_hq_view.actions.opacity = 0.4; [CATransaction commit];
     UIApplication.sharedApplication.idleTimerDisabled = NO;
+    if (shell_return) {
+        quit_hide_hold();
+        [g_fps_timer invalidate]; g_fps_timer = nil;
+        g_root.pad.userInteractionEnabled = NO;
+        dm_gamepad_teardown();
+    }
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         if (!save_sync_flush(8000)) LOG("front end: the save did not reach the cloud before quitting, it goes at the next start");
+        if (shell_return) {
+            dm_host_teardown_for_shell();
+            dispatch_async(dispatch_get_main_queue(), ^{
+                hq_cancel(&g_hq);
+                front_ios_teardown();
+                shell_return();
+            });
+            return;
+        }
         dm_host_shutdown("the quit prompt");
     });
 }
@@ -790,7 +844,7 @@ static void quit_changed(hq_phase was, hq_phase now, GCController *holder) {
 }
 void front_ios_quit_poll(void) {   // DmGamepad.m on a controller's change, and the hold's timer (main queue)
     quit_start();
-    if (!g_hq_on || !g_root.game || g_hq_busy) return;
+    if (!g_hq_on || !g_root.game || g_hq_busy || atomic_load(&g_quitting)) return;
     g_hq_busy = 1;
     int home, a, b; GCController *holder = nil; quit_buttons(&home, &a, &b, &holder);
     double now = CACurrentMediaTime();
@@ -809,7 +863,7 @@ void front_ios_quit_poll(void) {   // DmGamepad.m on a controller's change, and 
 }
 static void quit_open(void) {   // the in-game menu's Quit
     quit_start();
-    if (!g_root.game) return;
+    if (!g_root.game || atomic_load(&g_quitting)) return;
     int home, a, b; GCController *holder = nil; quit_buttons(&home, &a, &b, &holder);
     hq_phase was = g_hq.phase;
     if (hq_touch_open(&g_hq, home, a, b) != was) quit_changed(was, HQ_PROMPT, nil);

@@ -550,3 +550,32 @@ void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
     *calls = atomic_load(&g_mp_calls); *pages = atomic_load(&g_mp_pages); *ns = atomic_load(&g_mp_ticks) * tb.numer / tb.denom;
 }
+void nvn_dirty_teardown(void) {
+    pthread_mutex_lock(&g_slot_mu);
+    atomic_fetch_add(&g_range_epoch, 1);   // odd: find_span's per-thread caches stop answering, and they drop every range cached before the teardown
+    int n = atomic_exchange(&g_nr, 0);
+    for (int i = 0; i < n; i++) {
+        range_t *r = rg(i);
+        atomic_store_explicit(&r->live, 0, memory_order_relaxed);
+        while (atomic_load_explicit(&r->pins, memory_order_acquire) != 0) sched_yield();
+        free((void *)r->state); r->state = NULL;
+        free((void *)r->gen); r->gen = NULL;
+        free((void *)atomic_exchange(&r->sparse, NULL));
+        r->cap = 0;
+    }
+    for (int b = 0; b < NBLK; b++) {
+        range_t *blk = atomic_exchange(&g_blk[b], NULL);
+        free(blk);
+    }
+    free(g_open); g_open = NULL; g_nopen = g_copen = 0;
+    atomic_store(&g_opened, 0);
+    atomic_store(&g_open_changed, 0);
+    atomic_store(&g_live, 0);
+    atomic_store(&g_live_peak, 0);
+    atomic_store(&g_overflow_logged, 0);
+    atomic_store(&g_busy_red, 0);
+    atomic_store(&g_mp_begun, 0);
+    atomic_store(&g_mp_done, 0);
+    atomic_fetch_add(&g_range_epoch, 1);   // even again, a registry no cache entry was made against
+    pthread_mutex_unlock(&g_slot_mu);
+}

@@ -690,15 +690,16 @@ static MTLTextureSwizzleChannels tex_swz(const tex_t *t) {
     return o;
 }
 // The Metal sampler for parameters p sampling texture t: sampler states are shared, one per distinct set (the texture's level count and target are part of it)
+typedef struct { GLint minf, magf, ws, wt, wr, cmp; float lo, hi, aniso, b, bias; } skey;
+static struct { skey k; __strong id<MTLSamplerState> s; } g_samp_cache[256];   // file scope, so the host's teardown can empty it (dm_gl_teardown)
+static int g_nsamp_cache;
 static id<MTLSamplerState> samp_state(const samp_p *p, const tex_t *t) {
-    typedef struct { GLint minf, magf, ws, wt, wr, cmp; float lo, hi, aniso, b, bias; } skey;
-    static struct { skey k; __strong id<MTLSamplerState> s; } cache[256]; static int n;
     int mips = t->levels > 1;
     float top = mips ? (float)umin((uint32_t)t->maxlv, (uint32_t)t->levels - 1) : 0;
     skey k = {p->minf, p->magf, p->ws, p->wt, t->target == GL_TEXTURE_CUBE_MAP ? GL_CLAMP_TO_EDGE : p->wr, p->cmode ? p->cfunc : 0,
               mips ? fmaxf(0, fminf(top, p->minlod)) : 0, mips ? fmaxf(0, fminf(top, p->maxlod)) : 0, p->aniso,
               p->border[3] > 0.5f ? (p->border[0] > 0.5f ? 2.f : 1.f) : 0.f, fmaxf(-15, fminf(15, p->lodbias))};   // GL clamps the bias to GL_MAX_TEXTURE_LOD_BIAS
-    for (int i = 0; i < n; i++) if (!memcmp(&cache[i].k, &k, sizeof k)) return cache[i].s;
+    for (int i = 0; i < g_nsamp_cache; i++) if (!memcmp(&g_samp_cache[i].k, &k, sizeof k)) return g_samp_cache[i].s;
     MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
     d.supportArgumentBuffers = YES;
     d.magFilter = k.magf == GL_NEAREST ? MTLSamplerMinMagFilterNearest : MTLSamplerMinMagFilterLinear;
@@ -713,7 +714,7 @@ static id<MTLSamplerState> samp_state(const samp_p *p, const tex_t *t) {
     d.lodBias = k.bias;   // added to the level of detail a sample computes, as GL adds the texture's (Metal 4: macOS and iOS 26, the host's minimum)
     if (k.cmp) d.compareFunction = (MTLCompareFunction)(k.cmp - GL_NEVER);
     id<MTLSamplerState> s = [g_dev newSamplerStateWithDescriptor:d];
-    if (n < 256) { cache[n].k = k; cache[n].s = s; n++; } else RED1("more than 256 distinct sampler parameter sets");
+    if (g_nsamp_cache < 256) { g_samp_cache[g_nsamp_cache].k = k; g_samp_cache[g_nsamp_cache].s = s; g_nsamp_cache++; } else RED1("more than 256 distinct sampler parameter sets");
     return s;
 }
 // The Metal sampler a draw uses for texture t on a unit: the bound sampler object's parameters when there is one, else the texture's own (kept on the texture until they change)
@@ -1024,14 +1025,15 @@ static id<MTLRenderPipelineState> pso_get(prog_t *p, const pkey_t *k) {
     p->pc[p->npc].k = *k; p->pc[p->npc].pso = pso ? (__bridge_retained void *)pso : NULL; p->npc++;
     return pso;
 }
+typedef struct { GLenum sf, s1, s2, s3; GLuint rm, wm; } dface;
+typedef struct { uint8_t dt, dm, st; GLenum df; dface f[2]; } dkey;
+static struct { dkey k; __strong id<MTLDepthStencilState> s; } g_dss_cache[128];
+static int g_ndss_cache;
 static id<MTLDepthStencilState> dss_get(void) {
-    typedef struct { GLenum sf, s1, s2, s3; GLuint rm, wm; } dface;
-    typedef struct { uint8_t dt, dm, st; GLenum df; dface f[2]; } dkey;
-    static struct { dkey k; __strong id<MTLDepthStencilState> s; } cache[128]; static int n;
     dkey k; memset(&k, 0, sizeof k);   // padding too: the cache compares whole keys
     k.dt = S.depth && P.dpf; k.dm = S.dmask && S.depth && P.dpf; k.st = S.stencil && P.spf; k.df = S.depth ? S.dfunc : 0;
     if (k.st) for (int i = 0; i < 2; i++) { const stface_t *f = &S.st[i]; k.f[i] = (dface){f->func, f->fail, f->zfail, f->pass, f->mask & 0xff, f->wmask & 0xff}; }
-    for (int i = 0; i < n; i++) if (!memcmp(&cache[i].k, &k, sizeof k)) return cache[i].s;
+    for (int i = 0; i < g_ndss_cache; i++) if (!memcmp(&g_dss_cache[i].k, &k, sizeof k)) return g_dss_cache[i].s;
     MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
     if (k.dt) { d.depthCompareFunction = (MTLCompareFunction)(k.df - GL_NEVER); d.depthWriteEnabled = k.dm; }
     if (k.st) for (int fc = 0; fc < 2; fc++) {   // GL's front faces are Metal's (enc_state reverses the winding with the y flip)
@@ -1047,7 +1049,7 @@ static id<MTLDepthStencilState> dss_get(void) {
         if (fc) d.backFaceStencil = s; else d.frontFaceStencil = s;
     }
     id<MTLDepthStencilState> st = [g_dev newDepthStencilStateWithDescriptor:d];
-    if (n < 128) { cache[n].k = k; cache[n].s = st; n++; } else RED1("more than 128 depth / stencil states");
+    if (g_ndss_cache < 128) { g_dss_cache[g_ndss_cache].k = k; g_dss_cache[g_ndss_cache].s = st; g_ndss_cache++; } else RED1("more than 128 depth / stencil states");
     return st;
 }
 
@@ -1134,13 +1136,14 @@ static void ff_bind(void) {
     [e setFragmentTexture:texture atIndex:0];
     [e setFragmentSamplerState:sampler atIndex:0];
 }
+static int g_ff_failed;
 static prog_t *ff_prog(void) {
     if (!g_ffp.linked) {
-        static int failed; if (failed) return NULL;
+        if (g_ff_failed) return NULL;
         NSError *err = nil;
         id<MTLLibrary> lib = host_msl_lib(g_dev, nil, "gl_ff", &err);
         id<MTLFunction> vs = [lib newFunctionWithName:@"ff_vs"], fs = [lib newFunctionWithName:@"ff_fs"];
-        if (!vs || !fs) { failed = 1; GLOG("[RED] the fixed pipeline's shaders (gl_ff) do not load: %s", err.localizedDescription.UTF8String); return NULL; }
+        if (!vs || !fs) { g_ff_failed = 1; GLOG("[RED] the fixed pipeline's shaders (gl_ff) do not load: %s", err.localizedDescription.UTF8String); return NULL; }
         for (int st = 0; st < 2; st++) { strlcpy(g_ffsi[st].key, "fixed-function", sizeof g_ffsi[st].key); g_ffsi[st].frag = st; g_ffsi[st].ub_slot = 0; }
         g_ffsi[0].na = 3; g_ffsi[0].a = g_ffa;
         g_ffp.si[0] = &g_ffsi[0]; g_ffp.si[1] = &g_ffsi[1]; g_ffp.fn[0] = vs; g_ffp.fn[1] = fs;
@@ -1437,6 +1440,9 @@ GLB(glDrawElementsInstancedBaseVertex, void, GLenum mode, GLsizei count, GLenum 
 
 // ---------- Clears ----------
 // A clear the whole framebuffer takes (no scissor, nothing masked) becomes the next pass's load action; any other is a quad, which keeps the scissor rectangle and the masks
+static __strong id<MTLRenderPipelineState> g_clr_cache[16];
+static uint64_t g_clr_ck[16];
+static int g_nclr_cache;
 GLB(glClear, void, GLbitfield mask) {
     @autoreleasepool {
         uint32_t fw, fh; fb_size(S.fb, &fw, &fh);
@@ -1453,10 +1459,9 @@ GLB(glClear, void, GLbitfield mask) {
             return;
         }
         if (!pass_ensure()) return;
-        static __strong id<MTLRenderPipelineState> cache[16]; static uint64_t ck[16]; static int nc;
         uint64_t key = (uint64_t)P.cpf | (uint64_t)P.dpf << 16 | (uint64_t)P.spf << 32 | (uint64_t)((bits & GL_COLOR_BUFFER_BIT) ? S.cmask : 0) << 48;
         id<MTLRenderPipelineState> pso = nil;
-        for (int i = 0; i < nc; i++) if (ck[i] == key) pso = cache[i];
+        for (int i = 0; i < g_nclr_cache; i++) if (g_clr_ck[i] == key) pso = g_clr_cache[i];
         if (!pso && g_util) {
             MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
             pd.vertexFunction = [g_util newFunctionWithName:@"clr_vs"];
@@ -1467,7 +1472,7 @@ GLB(glClear, void, GLbitfield mask) {
             pd.depthAttachmentPixelFormat = P.dpf; pd.stencilAttachmentPixelFormat = P.spf;
             NSError *err = nil; pso = [g_dev newRenderPipelineStateWithDescriptor:pd error:&err];
             if (!pso) { RED1("clear pipeline: %s", err.localizedDescription.UTF8String); return; }
-            if (nc < 16) { ck[nc] = key; cache[nc++] = pso; }
+            if (g_nclr_cache < 16) { g_clr_ck[g_nclr_cache] = key; g_clr_cache[g_nclr_cache++] = pso; }
         }
         if (!pso) return;
         MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
@@ -3369,3 +3374,78 @@ EGL(eglGetProcAddress, void *, const char *name) {
     pthread_mutex_unlock(&mu);
     return fn;
 }
+
+void dm_gl_teardown(void) { @autoreleasepool {
+    if (!g_dev) return;
+    dm_gl_drain();
+    pass_end();
+    g_cb = nil;
+    pthread_mutex_lock(&g_last_mu);
+    g_last_cb = nil;
+    pthread_mutex_unlock(&g_last_mu);
+
+    for (int i = 0; i < 64; i++) { g_arena[i].buf = nil; g_arena[i].used = 0; g_arena[i].serial = 0; }
+    g_narena = 0; g_cur_arena = -1;
+
+    for (uint32_t i = 0; i < g_nbufs; i++) if (g_bufs[i]) { g_bufs[i]->mb = nil; free(g_bufs[i]); }
+    free(g_bufs); g_bufs = NULL; g_nbufs = g_capbufs = 0;
+
+    for (uint32_t i = 0; i < g_ntexs; i++) if (g_texs[i]) { tex_drop(g_texs[i]); g_texs[i]->smp = nil; free(g_texs[i]); }
+    free(g_texs); g_texs = NULL; g_ntexs = g_captexs = 0;
+
+    for (uint32_t i = 0; i < g_nrbs; i++) if (g_rbs[i]) { g_rbs[i]->tex = nil; free(g_rbs[i]); }
+    free(g_rbs); g_rbs = NULL; g_nrbs = g_caprbs = 0;
+
+    for (uint32_t i = 0; i < g_nfbs; i++) free(g_fbs[i]);
+    free(g_fbs); g_fbs = NULL; g_nfbs = g_capfbs = 0;
+
+    for (uint32_t i = 0; i < g_nvaos; i++) free(g_vaos[i]);
+    free(g_vaos); g_vaos = NULL; g_nvaos = g_capvaos = 0;
+
+    for (uint32_t i = 0; i < g_nsps; i++) if (g_sps[i]) {
+        if (g_sps[i]->is_prog) prog_clear(&g_sps[i]->p);
+        else { free(g_sps[i]->s.src); g_sps[i]->s.fn = nil; }
+        free(g_sps[i]);
+    }
+    free(g_sps); g_sps = NULL; g_nsps = g_capsps = 0;
+
+    for (int i = 0; i < g_nsamp_cache; i++) g_samp_cache[i].s = nil;
+    g_nsamp_cache = 0;
+    for (int i = 0; i < g_ndss_cache; i++) g_dss_cache[i].s = nil;
+    g_ndss_cache = 0;
+    for (int i = 0; i < g_nclr_cache; i++) g_clr_cache[i] = nil;
+    g_nclr_cache = 0;
+
+    for (int i = 0; i < NWIN; i++) { g_win.col[i] = nil; g_win.serial[i] = g_win.ticket[i] = 0; }
+    g_win.ds = nil; g_win.made = 0;
+
+    for (int i = 0; i < g_nsh; i++) { free(g_sh[i].a); free(g_sh[i].u); free(g_sh[i].t); free(g_sh[i].b); }
+    free(g_sh); g_sh = NULL; g_nsh = 0;
+
+    memset(g_active_query, 0, sizeof g_active_query);
+    for (uint32_t i = 0; i < g_nqueries; i++) if (g_queries[i]) query_free(g_queries[i]);
+    free(g_queries); g_queries = NULL; g_nqueries = g_capqueries = 0;
+
+    prog_clear(&g_ffp); memset(&g_ffp, 0, sizeof g_ffp);
+    memset(g_ffsi, 0, sizeof g_ffsi);
+    memset(&F, 0, sizeof F);
+    g_ff_failed = 0; g_ctx_fixed = 0; g_ctx_profile = 1;
+
+#if TARGET_OS_OSX
+    while (g_capture_stages) {
+        capture_stage *c = g_capture_stages;
+        g_capture_stages = c->next;
+        sh_free(&c->info);
+        c->fn = nil;
+        free(c);
+    }
+#endif
+    g_capture_dir = g_capture_compiler = NULL;
+    memset(&P, 0, sizeof P); enc_reset(); memset(&g_pend_clear, 0, sizeof g_pend_clear);
+    g_gl_error = 0; g_compiles = 0;
+
+    g_lib = nil; g_util = nil;
+    g_samp0 = nil;
+    g_tex0 = nil; g_cube0 = nil; g_tex3d0 = nil; g_arr0 = nil;
+    g_ev = nil; g_q = nil; g_dev = nil;
+} }

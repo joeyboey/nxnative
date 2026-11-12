@@ -181,6 +181,35 @@ static Result domain_request(uint32_t h, uint32_t *m, unsigned cmd, int pid, voi
     d[4] = 0x49434653; d[5] = 0; d[6] = cmd; d[7] = 0;
     return h_sf_Send(h, m, 0x100);
 }
+static int sf_close_calls, sf_stop_calls, sf_teardown_calls, sf_stop_saw_slot = -1;
+static uint32_t sf_lifecycle_handle;
+static uint32_t lc_answer(sf_req *q) { (void)q; return RES_OK; }
+static void lc_close(void *ctx) { (void)ctx; sf_close_calls++; }
+static void lc_stop(void *ctx) { (void)ctx; sf_stop_calls++; sf_stop_saw_slot = sf_slot(sf_lifecycle_handle); }
+static void lc_teardown(void *ctx) { free(ctx); sf_teardown_calls++; }
+
+static void check_two_phase_teardown(void) {
+    uint32_t a = 0;
+    CHECK(h_sf_Connect(&a, "olsc:u") == RES_OK && a, "a served session before the teardown check");
+
+    void *ctx = malloc(16);
+    sf_lifecycle_handle = sf_session_lifecycle("lc:test", lc_answer, ctx, lc_close, lc_stop, lc_teardown);
+    CHECK(sf_lifecycle_handle != 0 && sf_slot(sf_lifecycle_handle) >= 0, "sf_session_lifecycle registers active slot");
+
+    sf_close_calls = 0; sf_stop_calls = 0; sf_teardown_calls = 0; sf_stop_saw_slot = -1;
+    dm_sf_stop_all();
+    CHECK(sf_stop_calls == 1 && sf_stop_saw_slot >= 0, "dm_sf_stop_all invokes stop while slot is live");
+    CHECK(sf_close_calls == 0 && sf_teardown_calls == 0, "dm_sf_stop_all skips close and teardown");
+    CHECK(sf_slot(sf_lifecycle_handle) >= 0 && sf_slot(a) >= 0, "dm_sf_stop_all leaves session slots intact");
+
+    dm_sf_teardown();
+    CHECK(sf_teardown_calls == 1 && sf_close_calls == 0, "dm_sf_teardown invokes teardown and never close");
+    CHECK(sf_slot(sf_lifecycle_handle) < 0 && sf_slot(a) < 0, "dm_sf_teardown clears all slots");
+
+    uint32_t a2 = 0;
+    CHECK(h_sf_Connect(&a2, "olsc:u") == RES_OK && a2, "a session again after teardown");
+    h_sf_Close(a2);
+}
 int main(void) {
     uint32_t m[0x40], h = 0;
     CHECK(h_sf_Connect(&h, "olsc:u") == RES_OK && h, "olsc:u is served");
@@ -277,6 +306,7 @@ int main(void) {
     CHECK(request(dup, m, 5) == RES_OK && m[6] == 0x7c4u, "the duplicate answers as the camera");
     CHECK(request(dup, m, 4) == RES_OK && m[6] == RES_OK, "finalizing the camera library: success");
     h_sf_Close(dup); h_sf_Close(cam); h_sf_Close(h);
+    check_two_phase_teardown();
     printf("t_sf: %d checks, %d failed\n", checks, fails);
     return fails != 0;
 }
