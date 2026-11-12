@@ -187,7 +187,10 @@ static void launcher_done(void) { [g_root startGame]; }
     [self.view addSubview:self.game];
     g_layer = (CAMetalLayer *)self.game.layer;
     if (getenv("DM_METAL_HUD") && atoi(getenv("DM_METAL_HUD"))) { g_layer.developerHUDProperties = @{@"mode": @"default"}; LOG("front end: Metal performance HUD on (DM_METAL_HUD)"); }   // Apple's HUD over the game: frame rate, frame and GPU time, memory
-    else if (front_ios_hud_enabled_from_saved_choice()) g_layer.developerHUDProperties = @{@"mode": @"disabled"};   // the launcher switched off a HUD enabled by the saved choice
+    else if (front_ios_hud_enabled_from_saved_choice() || getenv("DM_HUD_PER_LAYER")) {
+        g_layer.developerHUDProperties = @{@"mode": @"disabled"};   // the launcher switched off a HUD enabled by the saved choice or the shell's per-start HUD
+        if (getenv("DM_HUD_PER_LAYER")) LOG("front end: Metal performance HUD off (DM_METAL_HUD)");   // the shell turns Metal's HUD on for every start (ShellMain.m)
+    }
     dm_haptics_apple_init();
     self.pad = dm_gamepad_view(self.view.bounds);
     self.pad.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;

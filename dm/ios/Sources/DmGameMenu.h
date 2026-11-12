@@ -13,6 +13,7 @@ void dm_pad_layout_set(int layout);   // releases every touch first, and is save
 void dm_gamepad_touch_feedback(bool on);   // DM_TOUCH_HAPTICS
 bool dm_setting_live(const char *env, const char *value);
 void *dm_quit_menu(void);   // front_ios.m: the menu's last item, Quit <game>, which opens the quit prompt (a retained UIMenu, shown inline)   // front_ios.m: value NULL asks whether the running game takes env at once; otherwise applies it
+int front_screen_max_fps(void);   // front.h, front_ios.m: the Frame rate row offers 120 only on a 120 Hz screen (LauncherSettings.swift); the shell framework's Swift imports this header, not the app's bridging header
 #ifdef __cplusplus
 }
 #endif
