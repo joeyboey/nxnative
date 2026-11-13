@@ -7,6 +7,7 @@
 #include <dispatch/dispatch.h>
 #include <stdatomic.h>
 #include <signal.h>
+#include <string.h>
 #include <unistd.h>
 void hlecount_flush(void); void dm_rec_finish(void);
 // The drain waits for the NVN calls under way. One that compiles its pipeline can take seconds (a draw waiting in pso_get → arch_capture → MTLCompiler: the stall a harness stops a
@@ -20,7 +21,34 @@ static void exit_end(void (*then)(void *), void *arg) {
     _exit(0);
 }
 static int ms_left(uint64_t t0, int budget_ms) { int64_t left = budget_ms - (int64_t)((now_ns() - t0) / 1000000); return left > 0 ? (int)left : 0; }
+static void (*g_shell_quit_fn)(const char *);
+void dm_host_set_shell_quit(void (*fn)(const char *)) { g_shell_quit_fn = fn; }
+int dm_host_has_shell_quit(void) { return g_shell_quit_fn != NULL; }
+
+typedef struct { const char *why; void (*then)(void *); void *arg; } dm_shutdown_bounce_t;
+static void *dm_shutdown_bounce_main(void *p) {
+    dm_shutdown_bounce_t *b = p;
+    const char *why = b->why; void (*then)(void *) = b->then; void *arg = b->arg;
+    free(b);
+    dm_host_shutdown_then(why, then, arg);
+    return NULL;
+}
 void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg) {
+    if (!then && g_shell_quit_fn && (!why || strcmp(why, "SIGTERM") != 0)) {
+        g_shell_quit_fn(why ? why : "shutdown");
+        if (dm_teardown_is_guest_thread()) dm_teardown_park_self();
+        return;
+    }
+    if (dm_teardown_is_guest_thread()) {
+        dm_shutdown_bounce_t *b = malloc(sizeof(*b));
+        pthread_t th;
+        if (b && (b->why = why, b->then = then, b->arg = arg, pthread_create(&th, NULL, dm_shutdown_bounce_main, b) == 0)) {
+            pthread_detach(th);
+            dm_teardown_park_self();
+            return;
+        }
+        free(b);
+    }
     static _Atomic int once; if (atomic_exchange(&once, 1)) return;
     uint64_t t0 = now_ns(); LOG("received %s: graceful exit", why);
     // Past every wait below (something else stuck): end the process all the same, and start the next program if the exit has not, so a hand-over does not become a quit
@@ -48,11 +76,15 @@ void dm_term_install(void) {
     dispatch_source_set_event_handler(g_term_src, ^{ dm_host_shutdown("SIGTERM"); });
     dispatch_resume(g_term_src);
 }
-void dm_vsync_stop_all(void);
-void dm_audio_stop_all(void);
-void dm_threads_park_all(void);
-void dm_guest_memory_release(int unmap_as);
-void dm_modules_teardown(void);
+void dm_audio_suspend(int on);
+// Weak defaults for the shell teardown: a binary that links this file without the host's other files (t_pso_archive, dm/gfx/tests) has none of them; the host's own definitions win
+__attribute__((weak)) void dm_vsync_stop_all(void) {}
+__attribute__((weak)) void dm_audio_stop_all(void) {}
+__attribute__((weak)) void dm_threads_park_all(void) {}
+__attribute__((weak)) void dm_guest_memory_release(int unmap_as) { (void)unmap_as; }
+__attribute__((weak)) void dm_modules_teardown(void) {}
+__attribute__((weak)) int dm_teardown_is_guest_thread(void) { return 0; }
+__attribute__((weak)) void dm_teardown_park_self(void) {}
 __attribute__((weak)) void dm_audren_stop_all(void) {}
 __attribute__((weak)) void dm_audren_teardown_post(void) {}
 __attribute__((weak)) void dm_movie_stop_all(void) {}
@@ -81,8 +113,8 @@ void dm_host_teardown_for_shell(void) {
     dm_cheats_exit();
     dm_vsync_stop_all();
     dm_sf_stop_all();
+    dm_audio_suspend(1);
     dm_audren_stop_all();
-    dm_audio_stop_all();
     dm_movie_stop_all();
     dm_codec_video_stop_all();
     dm_save_sync_stop();
@@ -91,6 +123,8 @@ void dm_host_teardown_for_shell(void) {
     dm_gfx_quit_begin();
     dm_gfx_suspend(1);
     dm_threads_park_all();
+    dm_bigstack_teardown();
+    dm_audio_stop_all();
     dm_haptics_apple_teardown();
     dm_switch2_teardown();
     dm_audren_teardown_post();

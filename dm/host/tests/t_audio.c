@@ -1,20 +1,107 @@
 // hle_audio.c unit test (silent sink): release events wake the reader, which drains the buffers in order.
 // Expected values are computed directly from the sample rate and block length: 4800 frames / 48 kHz = 100 ms.
 #include "../hle_audio.c"
+#include "../hle_audren.c"
 #include <time.h>
 #include <sys/mman.h>
 __thread _Atomic int dm_host_work;   // defined by the graphics host in a full build
+void dm_host_lock(pthread_mutex_t *m) { pthread_mutex_lock(m); }
 uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
-static struct { const void *k; void *v; } om[8];
-void *objmap_get(const void *k) { for (int i = 0; i < 8; i++) if (om[i].k == k) return om[i].v; return NULL; }
-void objmap_put(const void *k, void *v) { for (int i = 0; i < 8; i++) if (!om[i].k) { om[i].k = k; om[i].v = v; return; } }
-void *objmap_del(const void *k) { for (int i = 0; i < 8; i++) if (om[i].k == k) { om[i].k = 0; return om[i].v; } return NULL; }
+static struct { const void *k; void *v; } om[16];
+static pthread_mutex_t om_lock = PTHREAD_MUTEX_INITIALIZER;
+void *objmap_get(const void *k) {
+    pthread_mutex_lock(&om_lock);
+    void *v = NULL;
+    for (int i = 0; i < 16; i++) if (om[i].k == k) { v = om[i].v; break; }
+    pthread_mutex_unlock(&om_lock);
+    return v;
+}
+void objmap_put(const void *k, void *v) {
+    pthread_mutex_lock(&om_lock);
+    for (int i = 0; i < 16; i++) if (!om[i].k) { om[i].k = k; om[i].v = v; break; }
+    pthread_mutex_unlock(&om_lock);
+}
+void *objmap_del(const void *k) {
+    pthread_mutex_lock(&om_lock);
+    void *v = NULL;
+    for (int i = 0; i < 16; i++) if (om[i].k == k) { v = om[i].v; om[i].k = 0; break; }
+    pthread_mutex_unlock(&om_lock);
+    return v;
+}
 static _Atomic int g_sig;
 void hle_signal_system_event(void *g) { (void)g; atomic_fetch_add_explicit(&g_sig, 1, memory_order_seq_cst); }
 void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; }   // the real implementation needs a guest thread + SDK kernel event; the unit test only counts triggers
+uint64_t hle_system_event_binding(void *ev) { return (uint64_t)(uintptr_t)ev; }   // hle_audren.c (linked for the renderer teardown races): its device-change notices
+int hle_signal_system_event_binding(uint64_t binding) { (void)binding; return 0; }
+uint32_t hle_dup_readable_handle(uint32_t h) { return h; }
 module_t *module_of(const void *p) { (void)p; return NULL; }   // call sites in the log: no guest modules in the unit test
 int dm_guest_as_contains(uintptr_t a) { (void)a; return 0; }   // hle_svc.c: no guest address space in the unit test, so the big-stack take-overs (Start / Stop / CloseAudioOut, hle_bigstack.c) run on the calling host stack
 void dm_host_helper_qos(qos_class_t q) { (void)q; }   // hle_thread.c: the helper threads keep the default class in the unit test
+
+// Minimal AudioRenderer SDK + guest thread stubs to exercise real render_main <-> dm_audren_stop_all / teardown_post races.
+typedef struct { void (*fn)(void *); void *arg; pthread_t th; } mock_guest_th;
+static pthread_t g_last_render_th;
+static uint64_t g_mock_ar_objs[4];
+static _Atomic unsigned g_mock_ar_seq;
+static _Atomic int g_mock_exec_entered, g_mock_exec_hold, g_mock_exec_release, g_mock_ar_closed;
+
+static void *mock_guest_entry(void *p) {
+    mock_guest_th *m = p;
+    void (*fn)(void *) = m->fn;
+    void *arg = m->arg;
+    free(m);
+    fn(arg);
+    return NULL;
+}
+void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size) {
+    (void)prio; (void)stack_size;
+    pthread_t *holder = calloc(1, sizeof *holder);
+    mock_guest_th *m = calloc(1, sizeof *m);
+    if (!holder || !m) { free(holder); free(m); return NULL; }
+    m->fn = fn; m->arg = arg;
+    if (pthread_create(holder, NULL, mock_guest_entry, m)) { free(holder); free(m); return NULL; }
+    g_last_render_th = *holder;
+    return holder;
+}
+void dm_guest_thread_join(void *tt) {
+    pthread_t *holder = tt;
+    if (!holder) return;
+    pthread_join(*holder, NULL);
+    free(holder);
+}
+static size_t mock_ar_work_size(const uint8_t *p) { (void)p; return 0x4000; }
+static Result mock_ar_open0(void **handle, const uint8_t *param, void *work, size_t sz) {
+    (void)param; (void)work; (void)sz;
+    unsigned idx = atomic_fetch_add(&g_mock_ar_seq, 1) & 3u;
+    handle[0] = &g_mock_ar_objs[idx];
+    handle[1] = NULL;
+    return RES_OK;
+}
+static Result mock_ar_open_ev(void **handle, void *ev, const uint8_t *param, void *work, size_t sz) {
+    (void)ev;
+    return mock_ar_open0(handle, param, work, sz);
+}
+static void mock_ar_close(void *obj, void *state) {
+    (void)obj; (void)state;
+    atomic_fetch_add(&g_mock_ar_closed, 1);
+}
+static void mock_ar_exec(void *obj, void *state) {
+    (void)obj; (void)state;
+    atomic_fetch_add_explicit(&g_mock_exec_entered, 1, memory_order_seq_cst);
+    if (atomic_load_explicit(&g_mock_exec_hold, memory_order_acquire)) {
+        uint64_t start = now_ns();
+        while (!atomic_load_explicit(&g_mock_exec_release, memory_order_acquire) && now_ns() - start < 3000000000ull)
+            usleep(1000);
+    }
+}
+void *guest_sym(const char *name) {
+    if (!strcmp(name, "_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererParameterE")) return mock_ar_work_size;
+    if (!strcmp(name, "_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleERKNS0_22AudioRendererParameterEPvm")) return mock_ar_open0;
+    if (!strcmp(name, "_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm")) return mock_ar_open_ev;
+    if (!strcmp(name, "_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE")) return mock_ar_close;
+    if (!strcmp(name, "_ZN2nn5audio29ExecuteAudioRendererRenderingENS0_19AudioRendererHandleE")) return mock_ar_exec;
+    return NULL;
+}
 
 // A callback can finish several buffers, and the notifier can combine pending wakes.
 // Only inspect the released queue after an event, then take everything it announced.
@@ -136,8 +223,216 @@ static int test_rate_refused(void) {
     puts("AudioOut rate: 44.1 kHz refused with 0x699 and nothing opened; 0 and 48000 open at 48 kHz");
     return 0;
 }
+
+typedef struct {
+    _Atomic int go;
+    void *pcmout;
+    void *guest_out;
+    void *stream;
+} stop_race_ctx;
+
+static void *race_pcmout_close(void *p) {
+    stop_race_ctx *c = p;
+    while (!atomic_load_explicit(&c->go, memory_order_acquire)) sched_yield();
+    dm_pcmout_close(c->pcmout);
+    return NULL;
+}
+
+static void *race_guest_close(void *p) {
+    stop_race_ctx *c = p;
+    while (!atomic_load_explicit(&c->go, memory_order_acquire)) sched_yield();
+    h_au_Close(c->guest_out);
+    return NULL;
+}
+
+static void *race_stream_purge_and_close(void *p) {
+    stop_race_ctx *c = p;
+    while (!atomic_load_explicit(&c->go, memory_order_acquire)) sched_yield();
+    for (int i = 0; i < 8; i++) {
+        h_os_Purge(c->stream);
+        (void)h_os_Free(c->stream);
+    }
+    h_os_Close(c->stream);
+    return NULL;
+}
+
+static void *race_stop_all(void *p) {
+    stop_race_ctx *c = p;
+    while (!atomic_load_explicit(&c->go, memory_order_acquire)) sched_yield();
+    dm_audio_stop_all();
+    return NULL;
+}
+
+static void *race_audren_teardown(void *p) {
+    stop_race_ctx *c = p;
+    while (!atomic_load_explicit(&c->go, memory_order_acquire)) sched_yield();
+    dm_audren_teardown_post();
+    return NULL;
+}
+
+// Regression test for issue #1314: returning to the shell runs dm_audren_stop_all(), dm_audio_stop_all(),
+// and dm_audren_teardown_post() concurrently with guest CloseAudioOut / PurgeOutputStream or a render_main
+// thread outliving the 250 ms stop timeout, followed by same-process audio reopen without manual g_suspended resets.
+static int test_concurrent_close_and_stop_all(void) {
+    const char *prev_audio = getenv("DM_AUDIO");
+    setenv("DM_AUDIO", "0", 1);
+
+    // Part 1: delayed dm_pcmout_* and OutputStream operations arriving after dm_audio_stop_all().
+    static int16_t dummy_pcm[480 * 2];
+    aout_buf gb = {.ptr = dummy_pcm, .cap = sizeof dummy_pcm, .size = sizeof dummy_pcm};
+    void *late_pcm = dm_pcmout_open(2);
+    if (!late_pcm) return 1;
+    dm_pcmout_start(late_pcm);
+
+    char late_stream[0x350] = {0}, dev_name[0x100];
+    h_os_DefaultDev(dev_name);
+    int32_t os_fmt[3] = {OS_FLOAT, 2, 48000};
+    static float os_frames[2 * 240];
+    if (h_os_Open(late_stream, NULL, NULL, 0, dev_name, os_fmt, 2400, 1200, 0)) return 1;
+    if (h_os_Write(late_stream, os_frames, 240) != 240) return 1;
+    if (h_os_Start(late_stream)) return 1;
+
+    dm_audio_suspend(1);
+    dm_audio_stop_all();
+    if (g_suspended != 0 || g_wd_stop != 0) {
+        printf("FAIL stop_all left g_suspended=%d g_wd_stop=%d\n", g_suspended, g_wd_stop);
+        return 1;
+    }
+
+    dm_pcmout_wake(late_pcm);
+    dm_pcmout_wait(late_pcm, 5);
+    if (dm_pcmout_append(late_pcm, &gb) != 0) return 1;
+    if (dm_pcmout_released(late_pcm) != NULL) return 1;
+    dm_pcmout_start(late_pcm);
+    dm_pcmout_close(late_pcm);
+
+    // PurgeOutputStream / WriteOutputStream / CloseOutputStream after stop_all must not call die() or UAF.
+    h_os_Purge(late_stream);
+    (void)h_os_Write(late_stream, os_frames, 240);
+    h_os_Close(late_stream);
+
+    // Part 2: concurrent h_au_Close, dm_pcmout_close, PurgeOutputStream + CloseOutputStream, and dm_audio_stop_all.
+    enum { ROUNDS = 80 };
+    uint8_t prm[16];
+    h_au_InitParam(prm);
+    for (int i = 0; i < ROUNDS; i++) {
+        char guest[64], ev[64], stream[0x350];
+        memset(guest, 0, sizeof guest);
+        memset(stream, 0, sizeof stream);
+        if (h_au_Open(guest, ev, NULL, prm)) return 1;
+        h_au_Start(guest);
+        void *pcm = dm_pcmout_open(2);
+        if (!pcm) return 1;
+        dm_pcmout_start(pcm);
+        if (h_os_Open(stream, NULL, NULL, 0, dev_name, os_fmt, 2400, 1200, 0)) return 1;
+        if (h_os_Write(stream, os_frames, 240) != 240) return 1;
+        if (h_os_Start(stream)) return 1;
+
+        stop_race_ctx ctx = {.go = 0, .pcmout = pcm, .guest_out = guest, .stream = stream};
+        pthread_t t_pcm, t_guest, t_stream, t_stop;
+        if (pthread_create(&t_pcm, NULL, race_pcmout_close, &ctx)) return 1;
+        if (pthread_create(&t_guest, NULL, race_guest_close, &ctx)) return 1;
+        if (pthread_create(&t_stream, NULL, race_stream_purge_and_close, &ctx)) return 1;
+        if (pthread_create(&t_stop, NULL, race_stop_all, &ctx)) return 1;
+        atomic_store_explicit(&ctx.go, 1, memory_order_release);
+        pthread_join(t_pcm, NULL);
+        pthread_join(t_guest, NULL);
+        pthread_join(t_stream, NULL);
+        pthread_join(t_stop, NULL);
+
+        if (objmap_get(guest) || objmap_get(stream)) { puts("FAIL race cleanup: guest AudioOut or OutputStream still in objmap"); return 1; }
+        for (int k = 0; k < AOMAX; k++) if (g_aos[k] || g_oss[k]) { puts("FAIL race cleanup: g_aos or g_oss slot still occupied"); return 1; }
+        if (g_suspended != 0 || g_wd_stop != 0) { puts("FAIL race cleanup: g_suspended or g_wd_stop polluted"); return 1; }
+    }
+
+    // Part 3: AudioRenderer 250 ms timeout race between render_main and dm_audren_teardown_post (with and without dm_audio_stop_all).
+    uint8_t ar_param[P_SIZE] = {0};
+    *(int32_t *)ar_param = 48000;
+    *(int32_t *)(ar_param + 4) = 240;
+    *(int32_t *)(ar_param + P_DEVICE) = 1;
+    *(int32_t *)(ar_param + P_MODE) = 1;
+    static uint8_t ar_work[0x4000] __attribute__((aligned(0x1000)));
+    for (int mode = 0; mode < 3; mode++) {
+        void *ar_handle[2] = {0};
+        atomic_store(&g_mock_exec_entered, 0);
+        atomic_store(&g_mock_exec_release, 0);
+        atomic_store(&g_mock_exec_hold, 1);
+        if (h_ar_Open0(ar_handle, ar_param, ar_work, sizeof ar_work)) return 1;
+        pthread_t rth = g_last_render_th;
+        uint64_t wait0 = now_ns();
+        while (!atomic_load(&g_mock_exec_entered) && now_ns() - wait0 < 2000000000ull) usleep(1000);
+        if (!atomic_load(&g_mock_exec_entered)) { puts("FAIL audren timeout test: render_main never entered exec"); return 1; }
+
+        // Expires the 250 ms wait while render_main is still inside mock_ar_exec.
+        dm_audren_stop_all();
+        if (mode != 2) dm_audio_stop_all();
+
+        if (mode == 0) {
+            // teardown_post wins first; render_main exits afterward and must see pcmout == NULL (no double-free).
+            dm_audren_teardown_post();
+            atomic_store_explicit(&g_mock_exec_release, 1, memory_order_release);
+        } else {
+            // render_main exit and dm_audren_teardown_post race head-to-head on cq_mu / owned_out.
+            stop_race_ctx td_ctx = {.go = 0};
+            pthread_t t_td;
+            if (pthread_create(&t_td, NULL, race_audren_teardown, &td_ctx)) return 1;
+            atomic_store_explicit(&g_mock_exec_release, 1, memory_order_release);
+            atomic_store_explicit(&td_ctx.go, 1, memory_order_release);
+            pthread_join(t_td, NULL);
+        }
+        pthread_join(rth, NULL);
+        for (int k = 0; k < AOMAX; k++) if (g_aos[k]) { puts("FAIL audren timeout test: g_aos slot leaked"); return 1; }
+        for (int k = 0; k < AR_MAX; k++) if (g_ar[k].handle[0] || g_ar[k].pcmout) { puts("FAIL audren timeout test: g_ar slot not cleaned"); return 1; }
+    }
+
+    // Reopen AudioRenderer in the same process after timeout teardown and close cleanly.
+    atomic_store(&g_mock_exec_entered, 0);
+    atomic_store(&g_mock_exec_hold, 0);
+    void *reopen_ar[2] = {0};
+    if (h_ar_Open0(reopen_ar, ar_param, ar_work, sizeof ar_work)) return 1;
+    uint64_t wait_reopen = now_ns();
+    while (atomic_load(&g_mock_exec_entered) < 2 && now_ns() - wait_reopen < 2000000000ull) usleep(1000);
+    if (atomic_load(&g_mock_exec_entered) < 2) { puts("FAIL audren reopen did not render frames"); return 1; }
+    h_ar_Close(reopen_ar[0], reopen_ar[1]);
+
+    // Part 4: real AudioUnit + au_watchdog stop_all followed by same-process reopen (verifying no g_suspended == 2 pollution).
+    setenv("DM_AUDIO", "1", 1);
+    char au1[64] = {0}, au2[64] = {0}, au_ev[64] = {0};
+    static int16_t reopen_pcm[2][2400 * 2];
+    aout_buf reopen_buf[2];
+    if (h_au_Open(au1, au_ev, NULL, prm)) return 1;
+    h_au_Start(au1);
+    if (!g_wd_on) { puts("FAIL real audio did not start watchdog before stop_all"); return 1; }
+    dm_audio_suspend(1);
+    dm_audio_stop_all();
+    if (g_suspended != 0 || g_wd_stop != 0 || g_wd_on != 0) {
+        printf("FAIL real audio stop_all left state g_suspended=%d g_wd_stop=%d g_wd_on=%d\n", g_suspended, g_wd_stop, g_wd_on);
+        return 1;
+    }
+    atomic_store(&g_sig, 0);
+    if (h_au_Open(au2, au_ev, NULL, prm)) return 1;
+    if (!g_wd_on) { puts("FAIL real audio reopen did not restart au_watchdog"); return 1; }
+    for (int i = 0; i < 2; i++) {
+        set_buf(&reopen_buf[i], reopen_pcm[i], sizeof reopen_pcm[i], sizeof reopen_pcm[i]);
+        if (!h_au_Append(au2, &reopen_buf[i])) return 1;
+    }
+    h_au_Start(au2);
+    uint64_t t_reopen = now_ns();
+    int reclaimed = 0;
+    while (reclaimed < 2 && now_ns() - t_reopen < 5000000000ull) {
+        if (h_au_Released(au2)) reclaimed++;
+        else usleep(1000);
+    }
+    h_au_Close(au2);
+    if (reclaimed != 2) { puts("FAIL real audio reopen after dm_audio_stop_all did not release buffers"); return 1; }
+
+    if (prev_audio) setenv("DM_AUDIO", prev_audio, 1); else unsetenv("DM_AUDIO");
+    puts("concurrent CloseAudioOut / PurgeOutputStream / audren timeout vs stop_all + same-process reopen: PASS");
+    return 0;
+}
+
 int main(void) {
-    if (test_buffer_layout() || test_surround_output() || test_output_lifetime() || test_rate_refused()) return 1;
+    if (test_buffer_layout() || test_surround_output() || test_output_lifetime() || test_rate_refused() || test_concurrent_close_and_stop_all()) return 1;
     char out[64], ev[64]; uint8_t prm[16]; aout_buf b[3]; static int16_t pcm[3][4800 * 2];
     h_au_InitParam(prm);
     if (h_au_Open(out, ev, NULL, prm)) return 1;
@@ -214,4 +509,3 @@ int main(void) {
     return !ok3;
 }
 
-void dm_audio_device_changed(void) {}   // renderer notification delivery is checked by t_audren_work

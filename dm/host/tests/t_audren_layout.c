@@ -109,6 +109,7 @@ void dm_pcmout_wait(void *k, int ms) {
         pace_advance(callback < timeout ? callback : timeout);
     }
 }
+void dm_pcmout_wake(void *k) { (void)k; }
 void hle_bind_system_event(void *ev, int ac) { (void)ev; (void)ac; }
 uint32_t hle_dup_readable_handle(uint32_t h) { return h; }
 

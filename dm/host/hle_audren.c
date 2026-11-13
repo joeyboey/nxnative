@@ -30,6 +30,7 @@ void dm_pcmout_start(void *k);
 int dm_pcmout_append(void *k, void *b);
 void *dm_pcmout_released(void *k);
 void dm_pcmout_wait(void *k, int ms);
+void dm_pcmout_wake(void *k);
 
 // P_SIZE: bytes of the game's AudioRendererParameter copied before the two fields are changed. SDK 16's struct is 0x38 bytes; SDK 8's (Link's Awakening) has one more word,
 // its revision at +0x38: copying only 0x38 left the revision uninitialized and the SDK rejected it (CheckValidRevision, Result 0x499). The SDK reads only its own size of the copy
@@ -104,17 +105,18 @@ HLE_FORCE("_ZN2nn5audio30GetAudioRendererWorkBufferSizeERKNS0_22AudioRendererPar
 // globals: a second renderer's updates rendered catch-up frames into the first one's output queue, about 10% of its frames (Mario & Luigi: Brothership), and its own frames were never rendered otherwise
 enum { CQ = 4, AR_MAX = 4, RENDER_MIN_NS = 4500000 };   // AR_MAX as g_rev below
 typedef struct {
+    pthread_mutex_t cq_mu; pthread_cond_t cq_cv; int cq_init;   // kept across slot reuse so a late render_main exit never locks a zeroed mutex
     void *handle[2];                         // AudioRendererHandle (renderer object, client state); handle[0] NULL: a free slot
     uint8_t *sys;                            // its AudioRenderSystem, from its first render or update (ar_of_sys)
     _Atomic int open;
     void *render_tt;                         // the render thread (ThreadType from dm_guest_thread_spawn): Close joins it before the SDK tears the renderer down
+    void *pcmout; int render_active;         // host PCM output key and active flag (under cq_mu) for host-thread teardown sync
     int16_t frame[FRAME_MAX * DM_AUDIO_SINK_CHANNELS]; int frame_n;   // the latest frame (six channels plus their stereo fold)
     _Atomic uint64_t frames, nonsilent, updates, renders, catchups;
     uint64_t last_r; int updated;            // the render count at the last update, once there was one
     int16_t cq[CQ][FRAME_MAX * DM_AUDIO_SINK_CHANNELS]; int cq_n[CQ]; uint32_t cq_head, cq_tail;   // output queue of catch-up frames
     // A fresh render holds cq_mu while the SDK signals the renderer event. A woken guest thread can enter RequestUpdate and need cq_mu before the signal's handoff returns.
     // Take the mutex with dm_host_lock so a thread waiting for it counts as blocked.
-    pthread_mutex_t cq_mu; pthread_cond_t cq_cv;   // serializes catch-up publication, dequeue and fresh renders; wake on enqueue, dequeue or close
     int sink_logged;
     int32_t up_buf[DM_AUDIO_SINK_CHANNELS * (15 + FRAME_MAX)]; uint32_t up_pos;   // up_3_2's last samples and position
     int16_t pcm[NBUF][FRAME_MAX * DM_AUDIO_SINK_CHANNELS]; aout_buf bufs[NBUF];   // the blocks its output plays from (six channels plus their stereo fold): AudioOut queues only the pointer and copies the samples when the sound card asks (issue #1336)
@@ -167,15 +169,21 @@ static void render_main(void *arg) {
     void *out = dm_pcmout_open_sink();
     aout_buf *free_list[NBUF]; int nfree = NBUF;
     for (int i = 0; i < NBUF; i++) { a->bufs[i] = (aout_buf){.ptr = a->pcm[i], .cap = sizeof a->pcm[i], .size = 0}; free_list[i] = &a->bufs[i]; }
-    dm_pcmout_start(out);
+    pthread_mutex_lock(&a->cq_mu);
+    a->pcmout = out;
+    int start_ok = atomic_load(&a->open);
+    pthread_mutex_unlock(&a->cq_mu);
+    if (start_ok) dm_pcmout_start(out);
     LOG("audren: render thread %d started (%d buffers in flight, paced by the output)", ar_index(a), NBUF);
     uint64_t next_exec = 0;
     int prefill = NBUF;
     int rt = render_rt();
     while (atomic_load(&a->open)) {
         while (!nfree) {   // wait for the output to hand a block back (silent sink / sound card, one every 5 ms); it signals each release, so the thread sleeps until then (it used to poll every 1 ms)
+            if (!atomic_load(&a->open)) break;
             aout_buf *b = dm_pcmout_released(out);
             if (b) { free_list[nfree++] = b; break; }
+            if (!atomic_load(&a->open)) break;
             dm_pcmout_wait(out, 10);
             if (!atomic_load(&a->open)) break;
         }
@@ -209,11 +217,19 @@ static void render_main(void *arg) {
         b->size = bytes;
         if (queued) { a->cq_head++; pthread_cond_broadcast(&a->cq_cv); }   // the producer can reuse the slot after the copy
         pthread_mutex_unlock(&a->cq_mu);
-        if (!dm_pcmout_append(out, b)) free_list[nfree++] = b;
+        if (!atomic_load(&a->open) || !dm_pcmout_append(out, b)) free_list[nfree++] = b;
         else if (prefill) prefill--;
     }
     if (rt) render_rt_end();
-    dm_pcmout_close(out);   // the output would otherwise keep its sound card callback or silent sink running and hold one of the AudioOut slots after the renderer closes
+    pthread_mutex_lock(&a->cq_mu);
+    void *owned_out = a->pcmout;
+    a->pcmout = NULL;
+    pthread_mutex_unlock(&a->cq_mu);
+    if (owned_out) dm_pcmout_close(owned_out);   // the output would otherwise keep its sound card callback or silent sink running and hold one of the AudioOut slots after the renderer closes
+    pthread_mutex_lock(&a->cq_mu);
+    a->render_active = 0;
+    pthread_cond_broadcast(&a->cq_cv);   // an update waiting for queue space (catch-up pacing) or dm_audren_stop_all sees open / render_active cleared
+    pthread_mutex_unlock(&a->cq_mu);
 }
 
 // Both OpenAudioRenderer forms: CPU rendering + manual execution, then the host's render thread. With the event the game waits on it, which each render signals; without it the
@@ -295,15 +311,18 @@ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work,
     pthread_mutex_lock(&g_ar_mu);
     ar_t *a = NULL;
     for (int i = 0; i < AR_MAX && !a; i++) if (!g_ar[i].handle[0]) a = &g_ar[i];
-    if (a) {   // the slot's old contents are of a closed renderer, whose thread has ended; memset leaves no lock held
-        memset(a, 0, sizeof *a);
-        pthread_mutex_init(&a->cq_mu, NULL); pthread_cond_init(&a->cq_cv, NULL);
-        a->handle[0] = handle[0]; a->handle[1] = handle[1]; atomic_store(&a->open, 1);
+    if (a) {   // reset renderer state while keeping cq_mu / cq_cv initialized across slot reuse
+        if (!a->cq_init) { pthread_mutex_init(&a->cq_mu, NULL); pthread_cond_init(&a->cq_cv, NULL); a->cq_init = 1; }
+        pthread_mutex_lock(&a->cq_mu);
+        memset(a->handle, 0, sizeof *a - offsetof(ar_t, handle));
+        a->handle[0] = handle[0]; a->handle[1] = handle[1]; a->render_active = 1; atomic_store(&a->open, 1);
+        pthread_mutex_unlock(&a->cq_mu);
     }
     pthread_mutex_unlock(&g_ar_mu);
     LOG("audren: renderer %d opened from %s+%#llx", a ? ar_index(a) : -1, m ? m->name : "host", m ? (unsigned long long)((uint8_t *)ra - m->base) : 0ULL);
     if (!a) { LOG("[RED] audren: more than %d renderers: this one is not rendered", AR_MAX); return r; }
     a->render_tt = dm_guest_thread_spawn(render_main, a, 9, 0x10000);
+    if (!a->render_tt) { pthread_mutex_lock(&a->cq_mu); a->render_active = 0; pthread_mutex_unlock(&a->cq_mu); }
     return r;
 }
 HLE_FORCE("_ZN2nn5audio17OpenAudioRendererEPNS0_19AudioRendererHandleEPNS_2os11SystemEventERKNS0_22AudioRendererParameterEPvm", "open the renderer (with event): CPU rendering + manual execution, the host starts a render thread",
@@ -316,11 +335,14 @@ HLE_FORCE("_ZN2nn5audio18CloseAudioRendererENS0_19AudioRendererHandleE", "close 
     // Join the render thread first (it checks open every round and at most every 10 ms while waiting for the output): it may be inside exec(), which uses the renderer the SDK is about to free.
     // A fixed 20 ms sleep used to stand in for this, and a renderer reopened inside that window ran a second thread over the first one's blocks
     ar_t *a = NULL;
+    pthread_mutex_lock(&g_ar_mu);
     for (int i = 0; i < AR_MAX && !a; i++) if (g_ar[i].handle[0] == obj) a = &g_ar[i];
+    pthread_mutex_unlock(&g_ar_mu);
     if (a && a->render_tt) {
         dm_host_lock(&a->cq_mu);
         atomic_store(&a->open, 0);
         pthread_cond_broadcast(&a->cq_cv);
+        if (a->pcmout) dm_pcmout_wake(a->pcmout);
         pthread_mutex_unlock(&a->cq_mu);
         dm_guest_thread_join(a->render_tt);
         a->render_tt = NULL;
@@ -728,22 +750,46 @@ HLE_FORCE("_ZN2nn5audio21GetActiveChannelCountEv", "output channel count (SDK 7 
 void dm_audren_stop_all(void) {
     for (int i = 0; i < AR_MAX; i++) {
         atomic_store(&g_ar[i].open, 0);
-        if (g_ar[i].handle[0]) {
+        pthread_mutex_lock(&g_ar_mu);
+        int active = g_ar[i].handle[0] != NULL;
+        pthread_mutex_unlock(&g_ar_mu);
+        if (active) {
             pthread_mutex_lock(&g_ar[i].cq_mu);
+            if (g_ar[i].pcmout) dm_pcmout_wake(g_ar[i].pcmout);
             pthread_cond_broadcast(&g_ar[i].cq_cv);
+            struct timespec dl;
+            clock_gettime(CLOCK_REALTIME, &dl);
+            dl.tv_nsec += 250 * 1000000L;
+            if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+            while (g_ar[i].render_active && !pthread_cond_timedwait(&g_ar[i].cq_cv, &g_ar[i].cq_mu, &dl)) {}
             pthread_mutex_unlock(&g_ar[i].cq_mu);
         }
     }
 }
 void dm_audren_teardown_post(void) {
     for (int i = 0; i < AR_MAX; i++) {
-        if (g_ar[i].handle[0]) {
-            void *owned = objmap_del(g_ar[i].handle[0]);
+        pthread_mutex_lock(&g_ar_mu);
+        void *h0 = g_ar[i].handle[0];
+        pthread_mutex_unlock(&g_ar_mu);
+        if (h0) {
+            pthread_mutex_lock(&g_ar[i].cq_mu);
+            atomic_store(&g_ar[i].open, 0);
+            void *owned_out = g_ar[i].pcmout;
+            g_ar[i].pcmout = NULL;
+            g_ar[i].render_active = 0;
+            pthread_mutex_unlock(&g_ar[i].cq_mu);
+            if (owned_out) dm_pcmout_close(owned_out);
+            void *sev = rev_find(h0);
+            if (sev) rev_set(sev, NULL);
+            void *owned = objmap_del(h0);
             free(owned);
-            free(g_ar[i].render_tt);
+            pthread_mutex_lock(&g_ar_mu);
+            void *tt = g_ar[i].render_tt;
             g_ar[i].render_tt = NULL;
             g_ar[i].handle[0] = NULL;
             g_ar[i].sys = NULL;
+            pthread_mutex_unlock(&g_ar_mu);
+            free(tt);
         }
     }
     g_ar_in_process_v = -1;

@@ -307,6 +307,12 @@ void front_picture_shape(int w, int h) {   // front.h: the views take the presen
     });
 }
 
+bool dm_tv_connected(void) { return g_tv != nil || g_tv_mode_was >= 0; }
+static bool hud_live_available(void) {
+    const char *per = getenv("DM_HUD_PER_LAYER"), *mtl = getenv("MTL_HUD_ENABLED");
+    return (per && atoi(per) != 0) || (mtl && atoi(mtl) != 0);
+}
+
 // The settings the in-game menu offers (GameMenu.swift, from the gamepad's menu button), each taking effect while the game runs; the launcher's other settings need the next start.
 // value NULL: only whether env is one of them; otherwise apply it (GameMenu.swift has saved it and put it in the environment). Console mode changes as on a Switch put in or taken out of its
 // dock (the operation mode change notification); while a TV shows the picture the game stays docked, and the choice applies when the TV is unplugged
@@ -331,6 +337,16 @@ bool dm_setting_live(const char *env, const char *value) {
             setenv("DM_AUDIO_MIX", dm_audio_mix_env_value(value), 1);
             front_ios_audio_session();
             LOG("front end: audio mix %s (in-game menu)", dm_audio_mix_from_env() ? "on" : "off");
+        }
+        return true;
+    }
+    if (!strcmp(env, "DM_METAL_HUD")) {
+        if (!hud_live_available()) return false;
+        if (value) {
+            BOOL on = atoi(value) != 0;
+            setenv("DM_METAL_HUD", on ? "1" : "0", 1);
+            g_layer.developerHUDProperties = @{@"mode": on ? @"default" : @"disabled"};
+            LOG("front end: Metal performance HUD %s (in-game menu)", on ? "on" : "off");
         }
         return true;
     }
@@ -667,8 +683,10 @@ static void save_sync_background(void) {
 }
 
 static _Atomic int g_quitting;
+static _Atomic uint64_t g_quit_epoch __attribute__((section("__DATA,__dm_keep")));
+static void quit_now(void);
 void front_ios_focus_event(int ev) {
-    if (!g_layer || atomic_load(&g_quitting)) return;
+    if (ev != 4 && (!g_layer || atomic_load(&g_quitting))) return;
     switch (ev) {
         case 0: quit_close(); dm_movie_active(0); dm_gamepad_reset(); dm_focus_set(2); break;
         case 1: UIApplication.sharedApplication.idleTimerDisabled = NO; dm_focus_set(3); g_audio_bg = 1; front_ios_audio_apply(); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); save_sync_background(); break;
@@ -678,12 +696,23 @@ void front_ios_focus_event(int ev) {
             if (g_audio_intr) { LOG("audio session: active again with no interruption-ended notice; resuming"); g_audio_intr = 0; g_session_off = 1; }
             if (g_session_off) front_ios_audio_session();
             front_ios_audio_apply(); dm_gamepad_active(); dm_focus_set(1); dm_movie_active(1); break;
+        case 4: {   // DM_GLUE_FOCUS_REQUEST_QUIT: cross-game deep link / shell return request
+            uint64_t epoch = atomic_load(&g_quit_epoch);
+            if ([NSThread isMainThread]) {
+                if (g_layer && !atomic_load(&g_quitting)) quit_now();
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if (atomic_load(&g_quit_epoch) == epoch && g_layer && !atomic_load(&g_quitting)) quit_now();
+                });
+            }
+            break;
+        }
     }
 }
 
 // ---- Quit to the launcher (LNPANDY/NX2Apple#421) ----
 // Two ways open the quit prompt (quit_prompt.h) over the game: Quit at the end of the in-game menu (the gear at the top centre, GameMenu.swift, which stays while
-// a controller hides the other touch controls), and holding a controller's Home button for 2 seconds (home_quit.h, as on the Mac; the indicator at the top fills
+// a controller hides the other touch controls), and holding a controller's Home button or both - + + (View + Menu) for 2 seconds (home_quit.h, as on the Mac; the indicator at the top fills
 // while it is held). A tap on Quit or A quits, a tap on Cancel or outside the card, B or a new press of Home closes it. While it is open the game is told it lost
 // the focus, as the Switch's HOME menu does, and gets no touch or controller input.
 // Quitting ends the process: one game runs per process (dm_profile() and the host's early loading run once, the shell's ShellMain.m), so the engine cannot hand
@@ -738,7 +767,7 @@ static void quit_buttons(int *home, int *a, int *b, GCController *__strong *hold
     *home = *a = *b = 0;
     for (GCController *c in GCController.controllers) {
         GCExtendedGamepad *g = c.extendedGamepad; if (!g) continue;
-        if (g.buttonHome.isPressed) { *home = 1; if (!*holder) *holder = c; }
+        if (hq_pad_home(g.buttonHome.isPressed, g.buttonOptions.isPressed, g.buttonMenu.isPressed)) { *home = 1; if (!*holder) *holder = c; }
         *a |= g.buttonA.isPressed; *b |= g.buttonB.isPressed;
     }
 }
@@ -804,9 +833,21 @@ static void front_ios_teardown(void) {
         g_root = nil;
     }
     g_layer = nil;
+    atomic_fetch_add(&g_quit_epoch, 1);
     atomic_store(&g_quitting, 0);
 }
 // The prompt's quit: the cloud saves go out (as when the app goes to the background), then in the shell the host tears down its threads, GPU resources and 5 GB address space and returns the window to the library, or in a single-game app the host ends as on a SIGTERM. Off the main queue: both wait
+
+// Return to the shell cleanly when a hosted game exits on its own (dm_main return, svcExitProcess, svcBreak).
+void dm_shell_quit_from_guest(const char *why) {
+    if (atomic_load(&g_quitting) || !g_layer) return;
+    uint64_t epoch = atomic_load(&g_quit_epoch);
+    LOG("front end: guest exit triggers shell return (%s)", why ? why : "unknown");
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (atomic_load(&g_quit_epoch) == epoch && g_layer) quit_now();
+    });
+}
+
 static void quit_now(void) {
     if (atomic_exchange(&g_quitting, 1)) return;
     dm_shell_return_fn shell_return = (dm_shell_return_fn)dlsym(RTLD_DEFAULT, "dm_shell_return_to_library");

@@ -111,6 +111,7 @@ void dm_pcmout_start(void *k) { (void)k; }
 int dm_pcmout_append(void *k, void *b) { (void)k; (void)b; return 0; }
 void *dm_pcmout_released(void *k) { (void)k; return NULL; }
 void dm_pcmout_wait(void *k, int ms) { (void)k; (void)ms; }
+void dm_pcmout_wake(void *k) { (void)k; }
 void hle_bind_system_event(void *ev, int ac) {
     if (ev == notify_event) { assert(ac == 0); notify_binds++; notify_binding = 0x7000 + (unsigned)notify_binds; return; }
     if (ev == switch_event) { assert(ac == 0); switch_binding++; return; }

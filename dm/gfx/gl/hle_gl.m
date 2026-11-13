@@ -282,7 +282,12 @@ static void dev_init_once(void) {
         GLOG("Metal device %s; %d shader table entries", g_dev.name.UTF8String, g_nsh);
     }
 }
-static void dev_init(void) { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, dev_init_once); }
+static pthread_mutex_t g_dev_mu = PTHREAD_MUTEX_INITIALIZER;
+static void dev_init(void) {
+    pthread_mutex_lock(&g_dev_mu);
+    if (!g_dev) dev_init_once();
+    pthread_mutex_unlock(&g_dev_mu);
+}
 
 // ---------- Command buffers ----------
 // Transient memory (converted indices, staging for blits, large uniform blocks): bump allocation in 4 MB shared buffers, each reused once the command buffer that last used it completed
@@ -1885,7 +1890,15 @@ GLB(glClientWaitSync, GLenum, void *sy, GLbitfield flags, uint64_t timeout_ns) {
     }
     if (!timeout_ns) return GL_TIMEOUT_EXPIRED;
     uint64_t ms = timeout_ns / 1000000;
-    return [g_ev waitUntilSignaledValue:s->serial timeoutMS:ms ? ms : 1] ? GL_CONDITION_SATISFIED : GL_TIMEOUT_EXPIRED;
+    if (!ms) ms = 1;
+    for (;;) {
+        dm_teardown_check_current_thread();
+        uint64_t step = ms > 10 ? 10 : ms;
+        if ([g_ev waitUntilSignaledValue:s->serial timeoutMS:step]) return GL_CONDITION_SATISFIED;
+        if (dm_teardown_is_parking()) dm_teardown_check_current_thread();
+        if (ms <= step) return GL_TIMEOUT_EXPIRED;
+        ms -= step;
+    }
 }
 GL(glGenVertexArrays, void, GLsizei n, GLuint *out) { for (GLsizei i = 0; i < n; i++) out[i] = name_new((void ***)&g_vaos, &g_nvaos, &g_capvaos, sizeof(vao_t)); }
 GL(glDeleteVertexArrays, void, GLsizei n, const GLuint *v) { for (GLsizei i = 0; i < n; i++) if (v[i] && v[i] < g_nvaos && g_vaos[v[i]]) { free(g_vaos[v[i]]); g_vaos[v[i]] = NULL; if (S.vao == v[i]) S.vao = 0; } }
@@ -3243,8 +3256,9 @@ static pthread_once_t g_cur_once = PTHREAD_ONCE_INIT;
 static int g_cur_key_ok;
 static void cur_release(void *binding) { pthread_mutex_lock(&g_cur_mu); if (g_cur_owner == binding) g_cur_owner = NULL; pthread_mutex_unlock(&g_cur_mu); }
 static void cur_key_init(void) { g_cur_key_ok = pthread_key_create(&g_cur_key, cur_release) == 0; }
+static pthread_t g_mc_th;   // the thread a context was last made current on, and whether the first drawable sized it (reset by dm_gl_teardown)
+static int g_mc_known, g_mc_sized;
 EGL(eglMakeCurrent, EGLBoolean, EGLDisplay d, EGLSurface dr, EGLSurface rd, EGLContext c) {
-    static pthread_t th; static int known, sized;
     pthread_once(&g_cur_once, cur_key_init);
     if (!g_cur_key_ok) { t_egl_error = 0x3003; return EGL_FALSE; }   // BAD_ALLOC
     pthread_mutex_lock(&g_cur_mu);
@@ -3253,9 +3267,9 @@ EGL(eglMakeCurrent, EGLBoolean, EGLDisplay d, EGLSurface dr, EGLSurface rd, EGLC
         if (pthread_setspecific(g_cur_key, &t_cur)) { pthread_mutex_unlock(&g_cur_mu); t_egl_error = 0x3003; return EGL_FALSE; }
         g_cur_owner = &t_cur; t_cur.dpy = d; t_cur.ctx = c; t_cur.draw = dr; t_cur.read = rd;
     } else { if (g_cur_owner == &t_cur) g_cur_owner = NULL; pthread_setspecific(g_cur_key, NULL); memset(&t_cur, 0, sizeof t_cur); }
-    if (c && dr) { pthread_t me = pthread_self(); if (!known || !pthread_equal(th, me)) { th = me; known = 1; OLOG("context current on a new thread"); } }
+    if (c && dr) { pthread_t me = pthread_self(); if (!g_mc_known || !pthread_equal(g_mc_th, me)) { g_mc_th = me; g_mc_known = 1; OLOG("context current on a new thread"); } }
     // a context's viewport and scissor box start as its first drawable's size (LÖVE reads them back at start)
-    if (c && dr && !sized && g_win.made) { sized = 1; if (!S.vp[2] && !S.vp[3]) { S.vp[2] = S.sc[2] = g_win.w; S.vp[3] = S.sc[3] = g_win.h; } }
+    if (c && dr && !g_mc_sized && g_win.made) { g_mc_sized = 1; if (!S.vp[2] && !S.vp[3]) { S.vp[2] = S.sc[2] = g_win.w; S.vp[3] = S.sc[3] = g_win.h; } }
     pthread_mutex_unlock(&g_cur_mu);
     return EGL_TRUE;
 }
@@ -3292,25 +3306,33 @@ static void renderprogs_job(void) {
 static uint64_t g_next_swap;   // pacing without the display link: the earliest time of the next swap
 EGL(eglSwapBuffers, EGLBoolean, EGLDisplay d, EGLSurface s) {
     (void)d; (void)s;
+    dm_teardown_check_current_thread();
     dm_gfx_enter();
+    int vs = 1;
+    int next_k = 0;
     @autoreleasepool {
         if (!g_win.made) { int w, h; dm_vi_layer_size(&w, &h); win_make(w > 0 ? w : 1280, h > 0 ? h : 720); }
         if (g_pend_clear.bits) clears_flush();
         uint64_t v = cb_commit();
-        int vs = S.swap_interval < 1 ? 1 : S.swap_interval > 4 ? 4 : S.swap_interval;
+        vs = S.swap_interval < 1 ? 1 : S.swap_interval > 4 ? 4 : S.swap_interval;
         int k = g_win.cur;
         g_win.ticket[k] = mtl_present_ext(g_win.serial[k], vs / 60.0, (__bridge void *)g_ev, v, NULL);
-        g_win.cur = (k + 1) % NWIN;
-        if (g_win.ticket[g_win.cur]) mtl_present_wait(g_win.ticket[g_win.cur]);   // its previous present has been shown, so drawing into it again is safe
-        // Paced by the display link when it runs, as the Vulkan layer's acquire: the swap interval in vsyncs
-        uint64_t period = 1000000000ull * vs / 60, now = now_ns();
-        if (S.swap_interval > 0 && mtl_link_active() && mtl_link_wait_tick(vs, 2 * period)) g_next_swap = now_ns() + period;
-        else if (S.swap_interval > 0) {
-            if (g_next_swap > now) { uint64_t w = g_next_swap - now; struct timespec ts = {(time_t)(w / 1000000000ull), (long)(w % 1000000000ull)}; nanosleep(&ts, NULL); }
-            now = now_ns(); g_next_swap = g_next_swap && now < g_next_swap + period ? g_next_swap + period : now + period;
-        }
+        next_k = (k + 1) % NWIN;
+        g_win.cur = next_k;
     }
+    // Release the graphics suspend gate right after GPU commit/present so blocking waits never stall dm_gfx_suspend(1).
     dm_gfx_leave();
+    dm_teardown_check_current_thread();
+    if (g_win.ticket[next_k]) mtl_present_wait(g_win.ticket[next_k]);   // its previous present has been shown, so drawing into it again is safe
+    dm_teardown_check_current_thread();
+    // Paced by the display link when it runs, as the Vulkan layer's acquire: the swap interval in vsyncs
+    uint64_t period = 1000000000ull * vs / 60, now = now_ns();
+    if (S.swap_interval > 0 && mtl_link_active() && mtl_link_wait_tick(vs, 2 * period)) g_next_swap = now_ns() + period;
+    else if (S.swap_interval > 0) {
+        if (g_next_swap > now) { uint64_t w = g_next_swap - now; struct timespec ts = {(time_t)(w / 1000000000ull), (long)(w % 1000000000ull)}; nanosleep(&ts, NULL); }
+        now = now_ns(); g_next_swap = g_next_swap && now < g_next_swap + period ? g_next_swap + period : now + period;
+    }
+    dm_teardown_check_current_thread();
     frame_end();
     renderprogs_job();
     return EGL_TRUE;
@@ -3417,7 +3439,7 @@ void dm_gl_teardown(void) { @autoreleasepool {
     g_nclr_cache = 0;
 
     for (int i = 0; i < NWIN; i++) { g_win.col[i] = nil; g_win.serial[i] = g_win.ticket[i] = 0; }
-    g_win.ds = nil; g_win.made = 0;
+    g_win.ds = nil; g_win.made = 0; g_win.cur = 0; g_win.w = 0; g_win.h = 0;
 
     for (int i = 0; i < g_nsh; i++) { free(g_sh[i].a); free(g_sh[i].u); free(g_sh[i].t); free(g_sh[i].b); }
     free(g_sh); g_sh = NULL; g_nsh = 0;
@@ -3443,6 +3465,11 @@ void dm_gl_teardown(void) { @autoreleasepool {
     g_capture_dir = g_capture_compiler = NULL;
     memset(&P, 0, sizeof P); enc_reset(); memset(&g_pend_clear, 0, sizeof g_pend_clear);
     g_gl_error = 0; g_compiles = 0;
+    memset(&g_mc_th, 0, sizeof g_mc_th);
+    g_mc_known = g_mc_sized = 0;
+    pthread_mutex_lock(&g_cur_mu); g_cur_owner = NULL; pthread_mutex_unlock(&g_cur_mu);   // the next game's thread may make the context current
+    g_next_swap = 0;
+    g_frames = 0;
 
     g_lib = nil; g_util = nil;
     g_samp0 = nil;

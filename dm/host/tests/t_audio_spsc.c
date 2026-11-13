@@ -7,10 +7,27 @@ __thread _Atomic int dm_host_work;   // defined by the graphics host in a full b
 enum { NBUF = 100000, MAX_SIZE = 37 };
 
 uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
-static struct { const void *k; void *v; } om[8];
-void *objmap_get(const void *k) { for (int i = 0; i < 8; i++) if (om[i].k == k) return om[i].v; return NULL; }
-void objmap_put(const void *k, void *v) { for (int i = 0; i < 8; i++) if (!om[i].k) { om[i].k = k; om[i].v = v; return; } }
-void *objmap_del(const void *k) { for (int i = 0; i < 8; i++) if (om[i].k == k) { om[i].k = 0; return om[i].v; } return NULL; }
+static struct { const void *k; void *v; } om[16];
+static pthread_mutex_t om_lock = PTHREAD_MUTEX_INITIALIZER;
+void *objmap_get(const void *k) {
+    pthread_mutex_lock(&om_lock);
+    void *v = NULL;
+    for (int i = 0; i < 16; i++) if (om[i].k == k) { v = om[i].v; break; }
+    pthread_mutex_unlock(&om_lock);
+    return v;
+}
+void objmap_put(const void *k, void *v) {
+    pthread_mutex_lock(&om_lock);
+    for (int i = 0; i < 16; i++) if (!om[i].k) { om[i].k = k; om[i].v = v; break; }
+    pthread_mutex_unlock(&om_lock);
+}
+void *objmap_del(const void *k) {
+    pthread_mutex_lock(&om_lock);
+    void *v = NULL;
+    for (int i = 0; i < 16; i++) if (om[i].k == k) { v = om[i].v; om[i].k = 0; break; }
+    pthread_mutex_unlock(&om_lock);
+    return v;
+}
 
 static _Atomic int g_sig, g_after_last;
 static _Atomic int g_last_pull;
@@ -117,8 +134,92 @@ static int stop_pending(void) {
     printf("Stop releases partial/pending buffers in order, signals and preserves pre-start buffers: %s\n",failed?"FAIL":"PASS");
     atomic_store(&g_sig,0); return failed;
 }
+
+typedef struct {
+    void *out;
+    _Atomic int entered;
+    _Atomic int stop;
+    _Atomic int closed;
+} pcmout_wait_ctx;
+
+static void *pcmout_wait_worker(void *p) {
+    pcmout_wait_ctx *c = p;
+    atomic_store(&c->entered, 1);
+    while (!atomic_load(&c->stop)) dm_pcmout_wait(c->out, 5000);
+    dm_pcmout_close(c->out);
+    atomic_store(&c->closed, 1);
+    return NULL;
+}
+
+static int pcmout_teardown_while_waiting(void) {
+    pcmout_wait_ctx c = { .out = dm_pcmout_open(2) };
+    if (!c.out) return 1;
+    pthread_t th;
+    if (pthread_create(&th, NULL, pcmout_wait_worker, &c)) return 1;
+    while (!atomic_load(&c.entered)) sched_yield();
+    usleep(20000);
+    uint64_t t0 = now_ns();
+    atomic_store(&c.stop, 1);
+    dm_pcmout_wake(c.out);
+    pthread_join(th, NULL);
+    uint64_t elapsed_ms = (now_ns() - t0) / 1000000ull;
+    dm_audio_stop_all();
+
+    // Also verify idempotency if dm_audio_stop_all ran first before a concurrent dm_pcmout_close.
+    void *out2 = dm_pcmout_open(2);
+    if (!out2) return 1;
+    dm_audio_stop_all();
+    dm_pcmout_close(out2);
+
+    // Concurrent AudioOut append/close, OutputStream write/purge/close, dm_pcmout_close, and dm_audio_stop_all.
+    char dev[0x100];
+    h_os_DefaultDev(dev);
+    int32_t fmt[3] = {OS_FLOAT, 2, 48000};
+    static float os_pcm[2 * 120];
+    static int16_t au_pcm[120 * 2];
+    uint8_t prm[16];
+    h_au_InitParam(prm);
+    for (int r = 0; r < 50; r++) {
+        char au[64] = {0}, ev[64] = {0}, stream[0x350] = {0};
+        aout_buf gb = {.ptr = au_pcm, .cap = sizeof au_pcm, .size = sizeof au_pcm};
+        if (h_au_Open(au, ev, NULL, prm)) return 1;
+        h_au_Start(au);
+        (void)h_au_Append(au, &gb);
+        if (h_os_Open(stream, NULL, NULL, 0, dev, fmt, 1200, 600, 0)) return 1;
+        (void)h_os_Write(stream, os_pcm, 120);
+        (void)h_os_Start(stream);
+        void *po = dm_pcmout_open(2);
+        if (!po) return 1;
+        dm_pcmout_start(po);
+
+        dm_audio_stop_all();
+        // Late guest calls after stop_all must degrade safely without die() or UAF.
+        (void)h_au_Append(au, &gb);
+        (void)h_au_Released(au);
+        (void)h_au_BufCount(au);
+        h_au_Close(au);
+        h_os_Purge(stream);
+        h_os_Close(stream);
+        dm_pcmout_close(po);
+    }
+
+    // Reopen OutputStream after repeated stop_all cycles without touching internal globals.
+    char reopen_stream[0x350] = {0};
+    if (h_os_Open(reopen_stream, NULL, NULL, 0, dev, fmt, 480, 240, 0)) return 1;
+    if (h_os_Write(reopen_stream, os_pcm, 120) != 120 || h_os_Start(reopen_stream)) return 1;
+    uint64_t wait0 = now_ns();
+    while (h_os_Free(reopen_stream) != 480 && now_ns() - wait0 < 2000000000ull) usleep(1000);
+    int reopen_ok = h_os_Free(reopen_stream) == 480 && g_suspended == 0 && g_wd_stop == 0;
+    h_os_Close(reopen_stream);
+    atomic_store(&g_sig, 0);
+
+    int failed = !atomic_load(&c.closed) || elapsed_ms >= 500 || !reopen_ok;
+    printf("pcmout wake + teardown while waiting (%llu ms) + stop_all reopen: %s\n", (unsigned long long)elapsed_ms, failed ? "FAIL" : "PASS");
+    return failed;
+}
 int main(void) {
     if (stop_pending()) return 1;
+    if (pcmout_teardown_while_waiting()) return 1;
     char out[64], ev[64]; uint8_t prm[16];
     test_ctx t = {0};
     t.bufs = calloc(NBUF, sizeof *t.bufs); t.data = calloc(NBUF, sizeof *t.data); t.sizes = calloc(NBUF, sizeof *t.sizes); t.scratch = malloc(512);
