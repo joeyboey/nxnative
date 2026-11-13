@@ -27,8 +27,11 @@
 #include <TargetConditionals.h>
 #include <mach/mach.h>
 #include "../../host/host_image.h"
+#include "../msl_mount.h"
+#include <dispatch/dispatch.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <sys/mman.h>
 #include <time.h>
 #if TARGET_OS_OSX
 #include <crt_externs.h>
@@ -36,6 +39,7 @@
 #include <spawn.h>
 #include <sys/wait.h>
 #endif
+#include <unistd.h>
 
 int mtl_fps_target(void);
 int mtl_link_active(void); int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns);   // nvn_mtl.m
@@ -174,14 +178,12 @@ typedef struct { char name[48]; uint16_t slot; uint32_t size; } shblk;          
 typedef struct { char key[17]; int frag, ub_slot, ub_size, arg_slot, nargs, na, nu, nt, nb; shattr *a; shuni *u; shsamp *t; shblk *b; } shinfo;
 static shinfo *g_sh; static int g_nsh;
 static int sh_cmp(const void *a, const void *b) { int c = memcmp(((const shinfo *)a)->key, ((const shinfo *)b)->key, 16); return c ? c : ((const shinfo *)a)->frag - ((const shinfo *)b)->frag; }
-static int sh_read_abi(FILE *f) {
-    const char abi[] = "# GL shader ABI 2\n";
-    char line[sizeof abi];
-    return fgets(line, sizeof line, f) && !strcmp(line, abi);
-}
+static const char GL_SHADER_ABI[] = "# GL shader ABI 2";   // the table's first line (dm/gfx/tools/gl_shaders.py)
+static int sh_abi_line(const char *line) { size_t n = strlen(GL_SHADER_ABI); return !strncmp(line, GL_SHADER_ABI, n) && (line[n] == '\n' || line[n] == '\r' || !line[n]); }
+static int sh_read_abi(FILE *f) { char line[64]; return fgets(line, sizeof line, f) && sh_abi_line(line); }
 static void sh_free(shinfo *s) { free(s->a); free(s->u); free(s->t); free(s->b); }
 static int sh_read_row(char *line, shinfo *s) {
-    char *rest = line, *key = strsep(&rest, "\t"), *stage = strsep(&rest, "\t"), *res = strsep(&rest, "\t\n");
+    char *rest = line, *key = strsep(&rest, "\t"), *stage = strsep(&rest, "\t"), *res = strsep(&rest, "\t\r\n");
     if (!key || !stage || strlen(key) != 16 || (strcmp(stage, "vert") && strcmp(stage, "frag"))) return 0;
     *s = (shinfo){.frag = !strcmp(stage, "frag"), .ub_slot = -1, .arg_slot = -1, .nargs = -1};
     memcpy(s->key, key, 16);
@@ -191,10 +193,10 @@ static int sh_read_row(char *line, shinfo *s) {
     }
     int na = 0, nu = 0, nt = 0, nb = 0;
     for (const char *c = res; *c; c++) if (c == res || c[-1] == ' ') { na += *c == 'a'; nu += *c == 'u'; nt += *c == 't'; nb += *c == 'n'; }
-    s->a = zalloc((na + 1) * sizeof *s->a); s->u = zalloc((nu + 1) * sizeof *s->u); s->t = zalloc((nt + 1) * sizeof *s->t); s->b = zalloc((nb + 1) * sizeof *s->b);
+    s->a = zalloc((size_t)(na + 1) * sizeof *s->a); s->u = zalloc((size_t)(nu + 1) * sizeof *s->u); s->t = zalloc((size_t)(nt + 1) * sizeof *s->t); s->b = zalloc((size_t)(nb + 1) * sizeof *s->b);
     int bad = 0;
     char *save;
-    for (char *t = strtok_r(res, " ", &save); t; t = strtok_r(NULL, " ", &save)) {
+    for (char *t = strtok_r(res, " \r", &save); t; t = strtok_r(NULL, " \r", &save)) {
         char nm[64], ty[32]; unsigned a1, a2, a3; int sa;
         if (t[0] == 'a' && (unsigned)s->na < (unsigned)na && sscanf(t, "a:%63[^=]=%u:%31s", nm, &a1, ty) == 3 && a1 < 16) {
             shattr *x = &s->a[s->na++]; strlcpy(x->name, nm, sizeof x->name); x->slot = a1; x->type = tcode(ty);
@@ -222,29 +224,67 @@ static id<MTLLibrary> sh_library(const char *path) {
 static id<MTLFunction> sh_function(id<MTLLibrary> lib, const shinfo *s) {
     return [lib newFunctionWithName:[NSString stringWithFormat:@"gl_%s_%c", s->key, s->frag ? 'f' : 'v']];
 }
+static void sh_append_line(char *line, int *cap) {
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r' || !line[0]) return;
+    shinfo s; if (!sh_read_row(line, &s)) return;
+    if (g_nsh == *cap) { *cap = *cap ? *cap * 2 : 1024; g_sh = realloc(g_sh, (size_t)*cap * sizeof *g_sh); }
+    g_sh[g_nsh++] = s;
+}
 static void sh_load(void) {
     const char *d = getenv("DM_MSL_DIR"); char p[1024];
-    if (!d) { GLOG("[RED] DM_MSL_DIR not set: the GL shader library cannot be found"); return; }
-    snprintf(p, sizeof p, "%s/gl/gl_shaders.tsv", d);
-    FILE *f = fopen(p, "r");
-    if (!f) {
-        if (!g_capture_compiler || errno != ENOENT) GLOG("[RED] cannot open %s (run dm/gfx/tools/gl_shaders.py first)", p);
-        return;
+    FILE *f = NULL;
+    if (d && *d) {
+        snprintf(p, sizeof p, "%s/gl/gl_shaders.tsv", d);
+        f = fopen(p, "r");
     }
-    static char line[65536]; int cap = 0;
-    if (!sh_read_abi(f)) {
-        GLOG("[RED] GL shader table has an incompatible ABI; rebuild with dm/gfx/tools/gl_shaders.py"); fclose(f); return;
+    int cap = 0;
+    if (f) {
+        static char line[65536];
+        if (!fgets(line, sizeof line, f) || !sh_abi_line(line)) {
+            GLOG("[RED] GL shader table has an incompatible ABI; rebuild with dm/gfx/tools/gl_shaders.py"); fclose(f); return;
+        }
+        while (fgets(line, sizeof line, f)) sh_append_line(line, &cap);
+        fclose(f);
+    } else {
+        void *tbuf = NULL; size_t tlen = 0;
+        if (!dm_msl_trailer_read("gl/gl_shaders.tsv", &tbuf, &tlen)) {
+            if (d && *d) {
+                if (!g_capture_compiler || errno != ENOENT) GLOG("[RED] cannot open %s (run dm/gfx/tools/gl_shaders.py first)", p);
+            } else {
+                GLOG("[RED] DM_MSL_DIR not set and DM_ROMFS has no gl/gl_shaders.tsv trailer");
+            }
+            return;
+        }
+        char *cur = (char *)tbuf;
+        if (!cur || !sh_abi_line(cur)) { GLOG("[RED] GL shader table has an incompatible ABI; rebuild with dm/gfx/tools/gl_shaders.py"); free(tbuf); return; }
+        char *nl0 = strchr(cur, '\n');
+        cur = nl0 ? nl0 + 1 : NULL;
+        while (cur && *cur) {
+            char *nl = strchr(cur, '\n');
+            if (nl) *nl = '\0';
+            sh_append_line(cur, &cap);
+            cur = nl ? nl + 1 : NULL;
+        }
+        free(tbuf);
     }
-    while (fgets(line, sizeof line, f)) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        shinfo s; if (!sh_read_row(line, &s)) continue;
-        if (g_nsh == cap) { cap = cap ? cap * 2 : 1024; g_sh = realloc(g_sh, cap * sizeof *g_sh); }
-        g_sh[g_nsh++] = s;
+    qsort(g_sh, (size_t)g_nsh, sizeof *g_sh, sh_cmp);
+    if (d && *d) snprintf(p, sizeof p, "%s/gl/gl_shaders.metallib", d);
+    if (d && *d && !access(p, F_OK)) {
+        g_lib = sh_library(p);
+    } else {
+        msl_map m;
+        if (dm_msl_trailer_map("gl/gl_shaders.metallib", &m)) {
+            NSError *err = nil;
+            void *base = m.base; size_t base_len = m.base_len;
+            dispatch_data_t dd = dispatch_data_create(m.data, m.size, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ munmap(base, base_len); });
+            g_lib = [g_dev newLibraryWithData:dd error:&err];
+            if (!g_lib) GLOG("[RED] shader library failed to load trailer gl/gl_shaders.metallib: %s", err.localizedDescription.UTF8String);
+        } else if (d && *d) {
+            GLOG("[RED] shader library failed to open %s", p);
+        } else {
+            GLOG("[RED] DM_MSL_DIR not set and DM_ROMFS has no gl/gl_shaders.metallib trailer");
+        }
     }
-    fclose(f);
-    qsort(g_sh, g_nsh, sizeof *g_sh, sh_cmp);
-    snprintf(p, sizeof p, "%s/gl/gl_shaders.metallib", d);
-    g_lib = sh_library(p);
 }
 static const shinfo *sh_find(const char *key, int frag) { shinfo k; memcpy(k.key, key, 16); k.frag = frag; return g_nsh ? bsearch(&k, g_sh, g_nsh, sizeof *g_sh, sh_cmp) : NULL; }
 
@@ -3398,7 +3438,7 @@ EGL(eglGetProcAddress, void *, const char *name) {
 }
 
 void dm_gl_teardown(void) { @autoreleasepool {
-    if (!g_dev) return;
+    if (!g_dev) { dm_msl_trailer_teardown(); return; }
     dm_gl_drain();
     pass_end();
     g_cb = nil;
@@ -3472,6 +3512,7 @@ void dm_gl_teardown(void) { @autoreleasepool {
     g_frames = 0;
 
     g_lib = nil; g_util = nil;
+    dm_msl_trailer_teardown();
     g_samp0 = nil;
     g_tex0 = nil; g_cube0 = nil; g_tex3d0 = nil; g_arr0 = nil;
     g_ev = nil; g_q = nil; g_dev = nil;

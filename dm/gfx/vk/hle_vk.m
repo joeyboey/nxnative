@@ -25,9 +25,13 @@
 #include <CommonCrypto/CommonDigest.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include "../../host/host_image.h"
+#include "../msl_mount.h"
+#include <dispatch/dispatch.h>
 #include <math.h>
 #include <stdatomic.h>
+#include <sys/mman.h>
 #include <time.h>
+#include <unistd.h>
 
 int mtl_fps_target(void);   // nvn_mtl.m: 60, or 30 when the frame rate is halved
 int mtl_link_active(void); int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns);   // nvn_mtl.m: whether the display link presents, and the wait for its ticks
@@ -231,44 +235,67 @@ static int sh_read_resources(shinfo *s, char *res) {
     }
     s->res = entries; return 1;
 }
+static void sh_parse_row(char *line, int *cap) {
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\r' || !line[0]) return;
+    char *rest = line, *key = strsep(&rest, "\t"), *stage = strsep(&rest, "\t"), *res = strsep(&rest, "\t\r\n");   // strsep keeps the empty resource field of a shader without resources
+    if (!key || !stage || !res || strlen(key) != 16) { LOG("[vk] [RED] malformed shader table row; shader refused"); return; }
+    shinfo s = {0}; memcpy(s.key, key, 16); s.frag = !strcmp(stage, "frag");
+    if (!strncmp(stage, "comp:", 5)) {
+        const char *p = stage + 5; unsigned x, y, z;
+        if (!sh_number(&p, &x) || *p++ != ',' || !sh_number(&p, &y) || *p++ != ',' || !sh_number(&p, &z) || *p || !x || !y || !z) goto invalid_stage;
+        s.comp = 1; s.wg[0] = (uint16_t)x; s.wg[1] = (uint16_t)y; s.wg[2] = (uint16_t)z;
+    } else if (!strncmp(stage, "geomvp:", 7)) {
+        const char *p = stage + 7; unsigned loc;
+        if (!sh_number(&p, &loc) || *p || loc >= 32) goto invalid_stage;
+        s.geom_vp = (int)loc + 1;
+    } else if (strcmp(stage, "vert") && !s.frag) goto invalid_stage;
+    if (!sh_read_resources(&s, res)) return;
+    if (g_nsh == *cap) { *cap = *cap ? *cap * 2 : 128; shinfo *q = realloc(g_sh, (size_t)*cap * sizeof *g_sh); if (!q) die("[vk] out of memory for the shader table"); g_sh = q; }
+    g_sh[g_nsh++] = s;
+    return;
+invalid_stage:
+    LOG("[vk] [RED] shader table %s: invalid stage %s; shader refused", key, stage);
+}
 static void sh_read_table(FILE *f) {
-    char *line = NULL; size_t length = 0; int cap = 0;
-    while (getline(&line, &length, f) >= 0) {
-        if (line[0] == '#' || line[0] == '\n') continue;
-        char *rest = line, *key = strsep(&rest, "\t"), *stage = strsep(&rest, "\t"), *res = strsep(&rest, "\t\n");   // strsep keeps the empty resource field of a shader without resources
-        if (!key || !stage || !res || strlen(key) != 16) { LOG("[vk] [RED] malformed shader table row; shader refused"); continue; }
-        shinfo s = {0}; memcpy(s.key, key, 16); s.frag = !strcmp(stage, "frag");
-        if (!strncmp(stage, "comp:", 5)) {
-            const char *p = stage + 5; unsigned x, y, z;
-            if (!sh_number(&p, &x) || *p++ != ',' || !sh_number(&p, &y) || *p++ != ',' || !sh_number(&p, &z) || *p || !x || !y || !z) goto invalid_stage;
-            s.comp = 1; s.wg[0] = (uint16_t)x; s.wg[1] = (uint16_t)y; s.wg[2] = (uint16_t)z;
-        } else if (!strncmp(stage, "geomvp:", 7)) {
-            const char *p = stage + 7; unsigned loc;
-            if (!sh_number(&p, &loc) || *p || loc >= 32) goto invalid_stage;
-            s.geom_vp = (int)loc + 1;
-        } else if (strcmp(stage, "vert") && !s.frag) goto invalid_stage;
-        if (!sh_read_resources(&s, res)) continue;
-        if (g_nsh == cap) { cap = cap ? cap * 2 : 128; shinfo *q = realloc(g_sh, cap * sizeof *g_sh); if (!q) die("[vk] out of memory for the shader table"); g_sh = q; }
-        g_sh[g_nsh++] = s;
-        continue;
-    invalid_stage:
-        LOG("[vk] [RED] shader table %s: invalid stage %s; shader refused", key, stage);
-    }
+    char *line = NULL; size_t length = 0; int cap = g_nsh;
+    while (getline(&line, &length, f) >= 0) sh_parse_row(line, &cap);
     free(line);
     if (ferror(f)) die("[vk] cannot read the shader table");
-    qsort(g_sh, g_nsh, sizeof *g_sh, sh_cmp);   // looked up by key (Super Mario Galaxy creates over 3,000 modules at boot)
+    qsort(g_sh, (size_t)g_nsh, sizeof *g_sh, sh_cmp);   // looked up by key (Super Mario Galaxy creates over 3,000 modules at boot)
 }
 static void sh_load(void) {
     const char *d = getenv("DM_MSL_DIR"); char p[1024];
-    if (!d) { LOG("[vk] [RED] DM_MSL_DIR not set: the Vulkan shader library cannot be found"); return; }
-    snprintf(p, sizeof p, "%s/vk/vk_shaders.tsv", d);
-    FILE *f = fopen(p, "r");
-    if (!f) { LOG("[vk] [RED] cannot open %s (run dm/gfx/tools/vk_shaders.py first)", p); return; }
-    sh_read_table(f); fclose(f);
-    snprintf(p, sizeof p, "%s/vk/vk_shaders.metallib", d);
+    FILE *f = NULL;
+    if (d && *d) {
+        snprintf(p, sizeof p, "%s/vk/vk_shaders.tsv", d);
+        f = fopen(p, "r");
+        if (!f) { LOG("[vk] [RED] cannot open %s (run dm/gfx/tools/vk_shaders.py first)", p); return; }
+        sh_read_table(f); fclose(f);
+    } else {
+        void *tbuf = NULL; size_t tlen = 0;   // no DM_MSL_DIR: the shader table of the RomFS image's DMMSLTR1 trailer
+        if (!dm_msl_trailer_read("vk/vk_shaders.tsv", &tbuf, &tlen)) { LOG("[vk] [RED] DM_MSL_DIR not set and DM_ROMFS has no vk/vk_shaders.tsv trailer"); return; }
+        f = fmemopen(tbuf, tlen, "r");
+        if (f) { sh_read_table(f); fclose(f); } else LOG("[vk] [RED] cannot read the shader table of the RomFS trailer");
+        free(tbuf);
+    }
     NSError *err = nil;
-    g_lib = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:@(p)] error:&err];
-    if (!g_lib) LOG("[vk] [RED] shader library failed to load %s: %s", p, err.localizedDescription.UTF8String);
+    if (d && *d) snprintf(p, sizeof p, "%s/vk/vk_shaders.metallib", d);
+    if (d && *d && !access(p, F_OK)) {
+        g_lib = [g_dev newLibraryWithURL:[NSURL fileURLWithPath:@(p)] error:&err];
+        if (!g_lib) LOG("[vk] [RED] shader library failed to load %s: %s", p, err.localizedDescription.UTF8String);
+    } else {
+        msl_map m;
+        if (dm_msl_trailer_map("vk/vk_shaders.metallib", &m)) {
+            void *base = m.base; size_t base_len = m.base_len;
+            dispatch_data_t dd = dispatch_data_create(m.data, m.size, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{ munmap(base, base_len); });
+            g_lib = [g_dev newLibraryWithData:dd error:&err];
+            if (!g_lib) LOG("[vk] [RED] shader library failed to load trailer vk/vk_shaders.metallib: %s", err.localizedDescription.UTF8String);
+        } else if (d && *d) {
+            LOG("[vk] [RED] shader library failed to open %s", p);
+        } else {
+            LOG("[vk] [RED] DM_MSL_DIR not set and DM_ROMFS has no vk/vk_shaders.metallib trailer");
+        }
+    }
 }
 static const shinfo *sh_find(const char *key) { shinfo k; memcpy(k.key, key, 16); return g_nsh ? bsearch(&k, g_sh, g_nsh, sizeof *g_sh, sh_cmp) : NULL; }
 
@@ -3004,7 +3031,7 @@ static void vk_set_free_cb(const void *value, void *context) {
 }
 
 void dm_vk_teardown(void) { @autoreleasepool {
-    if (!g_dev) return;
+    if (!g_dev) { dm_msl_trailer_teardown(); return; }
     dm_vk_drain();
 
     pthread_mutex_lock(&g_sets_mu);
@@ -3043,6 +3070,7 @@ void dm_vk_teardown(void) { @autoreleasepool {
     atomic_store(&g_n_resume, 0);
     g_fan_ps = nil; g_fan_failed = 0;
     g_lib = nil;
+    dm_msl_trailer_teardown();
     g_dss_off = nil;
     g_ev = nil;
     g_q = nil;
