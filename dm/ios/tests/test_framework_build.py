@@ -7,19 +7,22 @@ Four parts, each on synthetic inputs, no game files or Xcode:
   - the framework is signed before the app's executable, the framework's signature carries no entitlements, the app's
     keeps the Increased Memory Limit request, and the packed IPA has the framework where the app dlopens it. A default
     pack (no DM_FRAMEWORK) still has no Frameworks/ entry at all;
-  - DM_FRAMEWORK_ONLY puts the game's shader libraries into the framework in the form they have: an NVN game's one file
-    b-<chain>.img (dm/tools/shader_lib.py) as msl/b-<chain>.img, a folder as msl/<folder>, and a rebuild leaves only that one.
+  - DM_FRAMEWORK_ONLY strips the game's shader libraries from the framework (leaving no msl/ directory) and records
+    source shader metadata under .msl-cache/<id>.json.
 Only the signing and packing steps run (a stand-in app and framework, no Xcode); codesign is required for the third part.
 """
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 import unittest
 import zipfile
+import zlib
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / 'dm/games'))
@@ -160,6 +163,64 @@ class ProjectTemplateTests(unittest.TestCase):
     def test_the_default_mode_still_selects_project_yml(self):
         self.assertEqual(self.prepare(0), ('name: default\n', False))
 
+    def test_framework_targets_declare_title_id_and_app_icon_metadata(self):
+        spec = (REPO / 'dm/ios/project-framework.yml').read_text()
+        target = None
+        section = None
+        in_props = False
+        props_by_target = {}
+        for raw in spec.splitlines():
+            stripped = raw.split('#', 1)[0].rstrip()
+            if not stripped.strip():
+                continue
+            indent = len(stripped) - len(stripped.lstrip(' '))
+            text = stripped.strip()
+            if indent == 2 and text.endswith(':'):
+                target = text[:-1]
+                section = None
+                in_props = False
+            elif indent == 4 and target and text.endswith(':'):
+                section = text[:-1]
+                in_props = False
+            elif indent == 6 and target and section == 'info' and text == 'properties:':
+                in_props = True
+                props_by_target.setdefault(target, {})
+            elif indent <= 6:
+                in_props = False
+            elif indent == 8 and in_props and ':' in text:
+                key, value = text.split(':', 1)
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in ('"', "'"):
+                    value = value[1:-1]
+                props_by_target[target][key.strip()] = value
+
+        for fw_target in ('DmGame', 'DmShellGame'):
+            self.assertIn(fw_target, props_by_target)
+            self.assertEqual(props_by_target[fw_target].get('DMTitleID'), '${GAME}')
+            self.assertEqual(props_by_target[fw_target].get('CFBundleIconFile'), 'AppIcon.png')
+
+        if shutil.which('xcodegen'):
+            with tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary).resolve()
+                for rel in ('Sources', 'Gen/dm', 'Gen/Assets.xcassets', 'Gen/src', 'Gen/main', 'Gen/framework/dm', 'framework'):
+                    (root / rel).mkdir(parents=True, exist_ok=True)
+                for stub in ('Gen/dm.xcconfig', 'Gen/framework.xcconfig', 'Gen/embed.S', 'Gen/main/main.c',
+                             'framework/DmGameMarker.m', 'framework/ShellGlue.m', 'Sources/front_ios.m', 'Sources/DmGamepad.m',
+                             'Sources/GameMenu.swift', 'Sources/LauncherSettings.swift', 'Sources/CloudSaves.m',
+                             'Sources/SaveSync.m', 'Sources/DataBookmark.m', 'Gen/framework/profile.tsv',
+                             'Gen/framework/game.manifest.json', 'Gen/framework/objc_namespace.h', 'Gen/framework/exported_symbols.txt'):
+                    (root / stub).write_text('')
+                (root / 'project-framework.yml').write_text(spec)
+                env = dict(os.environ, GAME='010015100E123000', DM_BUNDLE_ID='org.nxnative.test', DM_DISPLAY_NAME='Fixture',
+                           DM_APP_VERSION='1.0', DM_TEAM_ID='0000000000', DM_APP_CATEGORY='public.app-category.games',
+                           DM_SHOW_FPS='NO', DM_LANG='en-US', DM_SCHEME_NAME='DmIOS')
+                res = subprocess.run(['xcodegen', 'generate', '-q', '--spec', 'project-framework.yml'], cwd=root, env=env, capture_output=True, text=True)
+                self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+                for plist_rel in ('Gen/framework/Info.plist', 'Gen/framework/ShellGame-Info.plist'):
+                    plist = plistlib.loads((root / plist_rel).read_bytes())
+                    self.assertEqual(plist.get('DMTitleID'), '010015100E123000')
+                    self.assertEqual(plist.get('CFBundleIconFile'), 'AppIcon.png')
+
 
 class FrameworkEnvironmentTests(unittest.TestCase):
     def test_build_environment_stays_with_its_framework(self):
@@ -274,7 +335,7 @@ class FrameworkPackagingTests(unittest.TestCase):
 
 @unittest.skipUnless(sys.platform == 'darwin', 'build_ipa.sh copies an image with macOS cp -c (clonefile)')
 class FrameworkOnlyShaderLibrariesTests(unittest.TestCase):
-    """DM_FRAMEWORK_ONLY's copy of the shader libraries into the game's framework, after a stand-in xcodebuild; no Xcode, no game files."""
+    """DM_FRAMEWORK_ONLY strips the shader libraries from the game framework and caches source metadata in out/.msl-cache/<GAME>.json."""
     FW = 'DmGame' + GAME
 
     def setUp(self):
@@ -305,42 +366,105 @@ class FrameworkOnlyShaderLibrariesTests(unittest.TestCase):
             self.assertTrue(image.is_file())
         return image if packed else folder
 
-    def build(self):
+    def build(self, icon=None):
         root = self.root
+        icon_path = icon if icon is not None else (root / 'no-icon.jpg')
         result = run_step(FRAMEWORK_ONLY, root, FRAMEWORK_ONLY=str(root / 'out'), FW_NAME=self.FW, O=str(root / 'pkg'), DD=str(root / 'dd'),
                           DM_BUNDLE_ID='org.nxnative.fixture', MSL_IOS=str(root / 'shaders'), MSLDIR='b-fixture', PSO='',
-                          ICON=str(root / 'no-icon.jpg'), PATH=f'{root / "bin"}:{os.environ["PATH"]}')
+                          ICON=str(icon_path), PATH=f'{root / "bin"}:{os.environ["PATH"]}')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.out / self.FW).is_file())
 
     def shaders(self):
-        return sorted(p.name for p in (self.out / 'msl').iterdir())
+        msl = self.out / 'msl'
+        return sorted(p.name for p in msl.iterdir()) if msl.exists() else []
 
     def test_a_packed_library_goes_in_as_its_one_file(self):
         image = self.library(packed=True)
         self.build()
-        self.assertEqual(self.shaders(), ['b-fixture.img'])
-        self.assertEqual((self.out / 'msl/b-fixture.img').read_bytes(), image.read_bytes())
+        self.assertFalse((self.out / 'msl').exists())
+        cache = json.loads((self.root / 'out/.msl-cache' / f'{GAME}.json').read_text())
+        self.assertEqual(cache['schema'], 1)
+        self.assertEqual(cache['title_id'], GAME)
+        self.assertEqual(cache['gfx_api'], 'nvn')
+        self.assertEqual(cache['chain'], 'b-fixture')
+        self.assertFalse(cache['multi_program'])
+        self.assertEqual(cache['lib_path'], str(image))
+        self.assertEqual(cache['msl_root'], str(self.root / 'shaders'))
+        self.assertEqual(cache['programs'], [])
 
     def test_a_library_folder_goes_in_as_a_folder(self):
-        self.library(packed=False)
+        folder = self.library(packed=False)
         self.build()
-        self.assertEqual(self.shaders(), ['b-fixture'])
-        self.assertEqual((self.out / 'msl/b-fixture/fixture_b.metallib').read_text(), 'shader')
+        self.assertFalse((self.out / 'msl').exists())
+        cache = json.loads((self.root / 'out/.msl-cache' / f'{GAME}.json').read_text())
+        self.assertEqual(cache['schema'], 1)
+        self.assertEqual(cache['title_id'], GAME)
+        self.assertEqual(cache['gfx_api'], 'nvn')
+        self.assertEqual(cache['chain'], 'b-fixture')
+        self.assertFalse(cache['multi_program'])
+        self.assertEqual(cache['lib_path'], str(folder))
+        self.assertEqual(cache['msl_root'], str(self.root / 'shaders'))
+        self.assertEqual(cache['programs'], [])
 
     def test_a_rebuild_leaves_only_the_current_library(self):
         (self.out / 'msl/b-fixture').mkdir(parents=True)   # an earlier build's folder, and another chain's library
         (self.out / 'msl/b-fixture/stale_b.metallib').write_text('stale')
         (self.out / 'msl/b-otherchain.img').write_text('other chain')
-        self.library(packed=True)
+        image = self.library(packed=True)
         self.build()
-        self.assertEqual(self.shaders(), ['b-fixture.img'])
+        self.assertFalse((self.out / 'msl').exists())
+        cache = json.loads((self.root / 'out/.msl-cache' / f'{GAME}.json').read_text())
+        self.assertEqual(cache['lib_path'], str(image))
+        self.assertEqual(cache['gfx_api'], 'nvn')
+        self.assertEqual(cache['chain'], 'b-fixture')
+
         image = self.library(packed=True, content='a newer shader')
         self.build()
-        self.assertEqual((self.out / 'msl/b-fixture.img').read_bytes(), image.read_bytes())
-        self.library(packed=False)
+        self.assertFalse((self.out / 'msl').exists())
+        cache = json.loads((self.root / 'out/.msl-cache' / f'{GAME}.json').read_text())
+        self.assertEqual(cache['lib_path'], str(image))
+
+        folder = self.library(packed=False)
         self.build()
-        self.assertEqual(self.shaders(), ['b-fixture'])
+        self.assertFalse((self.out / 'msl').exists())
+        cache = json.loads((self.root / 'out/.msl-cache' / f'{GAME}.json').read_text())
+        self.assertEqual(cache['lib_path'], str(folder))
+        self.assertEqual(cache['gfx_api'], 'nvn')
+        self.assertEqual(cache['chain'], 'b-fixture')
+
+    def test_icon_writes_512x512_app_icon_and_icon_and_missing_icon_removes_stale_files(self):
+        def png_chunk(tag, payload):
+            return struct.pack('>I', len(payload)) + tag + payload + struct.pack('>I', zlib.crc32(tag + payload) & 0xffffffff)
+
+        w, h = 16, 16
+        raw_rows = b''.join(b'\x00' + (b'\x20\x60\xc0' * w) for _ in range(h))
+        src_png = (b'\x89PNG\r\n\x1a\n' +
+                   png_chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0)) +
+                   png_chunk(b'IDAT', zlib.compress(raw_rows)) +
+                   png_chunk(b'IEND', b''))
+        src_icon = self.root / 'source-icon.png'
+        src_icon.write_bytes(src_png)
+
+        self.library(packed=True)
+        self.build(icon=src_icon)
+
+        icon_file = self.out / 'icon.png'
+        app_icon_file = self.out / 'AppIcon.png'
+        self.assertTrue(icon_file.is_file())
+        self.assertTrue(app_icon_file.is_file())
+        icon_bytes = icon_file.read_bytes()
+        app_icon_bytes = app_icon_file.read_bytes()
+        self.assertEqual(icon_bytes, app_icon_bytes)
+        self.assertEqual(icon_bytes[:8], b'\x89PNG\r\n\x1a\n')
+        self.assertEqual(icon_bytes[12:16], b'IHDR')
+        out_w, out_h = struct.unpack('>II', icon_bytes[16:24])
+        self.assertEqual((out_w, out_h), (512, 512))
+
+        # Rebuilding when ICON is missing cleans up both stale icon.png and AppIcon.png.
+        self.build()
+        self.assertFalse(icon_file.exists())
+        self.assertFalse(app_icon_file.exists())
 
 
 if __name__ == '__main__':
