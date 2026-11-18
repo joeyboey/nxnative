@@ -19,6 +19,7 @@
 #import <GameController/GameController.h>
 #import "CloudSaves.h"
 #import "quit_prompt.h"
+#import "audio_session_policy.h"
 
 void dm_gamepad_active(void);
 void dm_gamepad_pads_read(void);
@@ -30,6 +31,7 @@ static void quit_close(void);
 
 void front_ios_boot(void);
 int front_ios_boot_ok(void);
+void front_ios_audio_session(void);
 const char *front_ios_boot_message(void);   // main.m: why a build that keeps the game files off the IPA found none usable (NULL = the generic hint)
 const char *front_ios_device_check(void);   // main.m: why this device cannot run the games (its GPU has no BC textures; NULL = supported)
 bool front_ios_hud_enabled_from_saved_choice(void);   // main.m: the saved choice enabled Metal's HUD at launch
@@ -324,6 +326,14 @@ bool dm_setting_live(const char *env, const char *value) {
     if (!strcmp(env, "DM_SHOW_FPS")) { if (value) [g_root showFPS:atoi(value) != 0]; return true; }
     if (!strcmp(env, "DM_TOUCH_HAPTICS")) { if (value) dm_gamepad_touch_feedback(atoi(value) != 0); return true; }
     if (!strcmp(env, "DM_RUMBLE")) { if (value) { dm_haptics_set_enabled(atoi(value) != 0); LOG("front end: game rumble %s (in-game menu)", atoi(value) ? "on" : "off"); } return true; }
+    if (!strcmp(env, "DM_AUDIO_MIX")) {
+        if (value) {
+            setenv("DM_AUDIO_MIX", dm_audio_mix_env_value(value), 1);
+            front_ios_audio_session();
+            LOG("front end: audio mix %s (in-game menu)", dm_audio_mix_from_env() ? "on" : "off");
+        }
+        return true;
+    }
     return false;
 }
 @implementation DmTVSceneDelegate
@@ -584,7 +594,7 @@ void front_save_failed(int err) {
 
 // Audio session: the frames RemoteIO asks for in each callback follow the I/O buffer duration, about 21 ms by default on iOS (1024 frames at 48 kHz). The game keeps only 4 blocks × 5 ms = 20 ms in flight,
 // so every callback came up 1.3 ms short and was zero-filled, about 47 gaps per second (crackling; reproducible on the Mac by forcing 1024-frame callbacks: 1999 underruns in 2000 callbacks). Ask for 5 ms and the system picks the nearest it supports;
-// the category is Playback, as a game's or media app's: the ring / silent switch does not mute it (the default SoloAmbient follows the switch, which silenced the game whenever the phone was on silent) and it still interrupts other apps' audio.
+// the category is Playback, as a game's or media app's: the ring / silent switch does not mute it (the default SoloAmbient follows the switch, which silenced the game whenever the phone was on silent) and it interrupts other apps' audio unless DM_AUDIO_MIX=1 opts into AVAudioSessionCategoryOptionMixWithOthers (cleared explicitly to 0 when off so a shared shell keeps each game's setting isolated).
 // Set once at boot and again on return to the foreground (the system may reset it after an interruption)
 static int g_session_off;   // the last activation failed (another app or a call still held the session): tried again when the app becomes active
 // Six channels when the route takes them (HDMI, a multichannel interface or dock): the session's maximum is the route's, and it stays 2 on headphones, AirPods included.
@@ -594,14 +604,20 @@ static void front_ios_audio_channels(AVAudioSession *s) {
     if (want > 2 && ![s setPreferredOutputNumberOfChannels:want error:&e]) LOG("[RED] audio session: %ld output channels could not be set: %s", (long)want, e.localizedDescription.UTF8String);
     LOG("audio session: route %s, output channels %ld (route maximum %ld)", s.currentRoute.outputs.firstObject.portType.UTF8String ?: "(none)", (long)s.outputNumberOfChannels, (long)most);
 }
+void dm_audio_io_buffer_hint(unsigned frames);
 void front_ios_audio_session(void) {
     AVAudioSession *s = AVAudioSession.sharedInstance; NSError *e = nil;
-    if (![s setCategory:AVAudioSessionCategoryPlayback error:&e]) LOG("[RED] audio session category could not be set: %s", e.localizedDescription.UTF8String);
+    const char *mix_env = getenv("DM_AUDIO_MIX");
+    BOOL mix_on = dm_audio_mix_enabled(mix_env);
+    if (!dm_audio_session_apply(s, mix_env, &e)) LOG("[RED] audio session category could not be set: %s", e.localizedDescription.UTF8String);
     [s setPreferredSampleRate:48000 error:nil];
     if (![s setPreferredIOBufferDuration:0.005 error:&e]) LOG("[RED] audio session I/O buffer duration could not be set: %s", e.localizedDescription.UTF8String);
     g_session_off = ![s setActive:YES error:&e];
     if (g_session_off) LOG("[RED] audio session activation failed: %s", e.localizedDescription.UTF8String);
-    LOG("audio session: sample rate %.0f Hz, I/O buffer %.2f ms (asked for 5 ms)", s.sampleRate, s.IOBufferDuration * 1000);
+    unsigned io_frames = s.IOBufferDuration > 0 ? (unsigned)(s.IOBufferDuration * 48000.0 + 0.5) : 0;
+    if (mix_on && io_frames < 1024u) io_frames = 1024u;
+    dm_audio_io_buffer_hint((mix_on || io_frames > 240u) ? io_frames : 0u);
+    LOG("audio session: sample rate %.0f Hz, I/O buffer %.2f ms (asked for 5 ms), mix %s", s.sampleRate, s.IOBufferDuration * 1000, mix_on ? "on" : "off");
     front_ios_audio_channels(s);
 }
 // The channels the route takes now (hle_audio.c decides the output from it: six only when the session has six)
