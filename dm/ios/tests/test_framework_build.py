@@ -467,5 +467,122 @@ class FrameworkOnlyShaderLibrariesTests(unittest.TestCase):
         self.assertFalse(app_icon_file.exists())
 
 
+class FrameworkClonesTests(unittest.TestCase):
+    """The framework's executable and pipeline archive are clones of the build's own outputs (LNPANDY/NX2Apple#422), and a failed copy keeps what was there."""
+    FW = 'DmGame' + GAME
+    BIG = 'shader ' * 40000   # 280 KB: several blocks of file data
+
+    def setUp(self):
+        self.root = root = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, root)
+        (root / 'dm').mkdir()
+        (root / 'dm/tools').symlink_to(REPO / 'dm/tools', target_is_directory=True)
+        (root / 'bin').mkdir()
+        (root / 'bin/xcodebuild').write_text('#!/bin/sh\nexit 0\n')
+        (root / 'bin/xcodebuild').chmod(0o755)
+        self.built = root / 'dd/Build/Products/Release-iphoneos' / f'{self.FW}.framework'
+        self.built.mkdir(parents=True)
+        (self.built / self.FW).write_text(self.BIG)
+        (self.built / 'game.manifest.json').write_text(json.dumps({'framework_executable': self.FW}))
+        (root / 'shaders/b-fixture').mkdir(parents=True)
+        (root / 'shaders/b-fixture/fixture_b.metallib').write_text('shader')
+        self.pso = root / 'pso-src'
+        (self.pso / 'applegpu_g18p').mkdir(parents=True)
+        (self.pso / 'applegpu_g18p/archive.metallib').write_text(self.BIG.replace('shader', 'pipeln'))
+        self.out = root / 'out' / f'{self.FW}.framework'
+
+    def build(self, expect=0, **extra):
+        root = self.root
+        result = run_step(FRAMEWORK_ONLY, root, FRAMEWORK_ONLY=str(root / 'out'), FW_NAME=self.FW, O=str(root / 'pkg'), DD=str(root / 'dd'),
+                          DM_BUNDLE_ID='org.nxnative.fixture', MSL_IOS=str(root / 'shaders'), MSLDIR='b-fixture', PSO=str(self.pso),
+                          ICON=str(root / 'no-icon.jpg'), PATH=f'{root / "bin"}:{os.environ["PATH"]}', **extra)
+        if expect == 0: self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        else: self.assertNotEqual(result.returncode, 0, 'the build should fail')
+        return result
+
+    def failing_rename(self, suffix):
+        """A mv that fails where it would put a finished copy in its place (the source ends in `suffix`), and is mv everywhere else."""
+        mv = self.root / 'bin/mv'
+        mv.write_text(f'#!/bin/sh\nfor a in "$@"; do case "$a" in *{suffix}) exit 1;; esac; done\nexec /bin/mv "$@"\n')
+        mv.chmod(0o755)
+
+    @staticmethod
+    def extents(path):
+        """The device offset of each run of the file's data (fcntl F_LOG2PHYS_EXT): two files that share their blocks, as a clone and its source do, have the same list."""
+        import fcntl, struct
+        runs, size, at = [], os.path.getsize(path), 0
+        with open(path, 'rb') as f:
+            while at < size:
+                _, length, device = struct.unpack('=Iqq', fcntl.fcntl(f.fileno(), 65, struct.pack('=Iqq', 0, size - at, at)))
+                if length <= 0: break
+                runs.append((at, length, device)); at += length
+        return runs
+
+    def assertShared(self, copy, source):
+        self.assertEqual(Path(copy).read_bytes(), Path(source).read_bytes())
+        self.assertEqual(self.extents(copy), self.extents(source), f'{copy} is a second copy of {source} on disk, not a clone')
+
+    def needs_clones(self):
+        """Skips where the temporary folder's file system has no clones, or does not say where a file's blocks are."""
+        a, b = self.root / 'probe', self.root / 'probe.clone'
+        a.write_text(self.BIG)
+        try:
+            subprocess.run(['cp', '-c', str(a), str(b)], check=True, capture_output=True)
+            shared = self.extents(a) == self.extents(b) != []
+        except (OSError, subprocess.CalledProcessError): shared = False
+        a.unlink(); b.unlink(missing_ok=True)
+        if not shared: self.skipTest('the temporary folder is not on a file system with clones (APFS)')
+
+    def test_the_executable_and_the_pipeline_archive_are_clones_after_every_build(self):
+        self.needs_clones()
+        for rebuilt in ('dylib2', 'dylib3'):   # a first build, then rebuilds over it
+            self.build()
+            self.assertShared(self.out / self.FW, self.built / self.FW)
+            self.assertShared(self.out / 'pso/applegpu_g18p/archive.metallib', self.pso / 'applegpu_g18p/archive.metallib')
+            self.assertEqual(sorted(p.name for p in self.out.iterdir() if p.name.endswith(('.part', '.old'))), [])
+            (self.built / self.FW).write_text(self.BIG.replace('shader', rebuilt))
+            (self.pso / 'applegpu_g18p/archive.metallib').write_text(self.BIG.replace('shader', rebuilt))
+
+    def test_what_the_archive_no_longer_has_is_gone(self):
+        self.build()
+        (self.pso / 'applegpu_g18p/archive.metallib').rename(self.pso / 'applegpu_g18p/other.metallib')
+        self.build()
+        self.assertEqual(sorted(p.name for p in (self.out / 'pso/applegpu_g18p').iterdir()), ['other.metallib'])
+
+    def test_an_unchanged_executable_keeps_its_file(self):
+        self.build()
+        before = (self.out / self.FW).stat()
+        self.build()
+        after = (self.out / self.FW).stat()
+        self.assertEqual((before.st_ino, before.st_mtime_ns), (after.st_ino, after.st_mtime_ns))
+
+    def test_a_copy_works_without_clones(self):
+        """cp -c falls back to a plain copy where the volume cannot clone, so the output is the same bytes: the fake cp refuses -c as such a volume does."""
+        cp = self.root / 'bin/cp'
+        cp.write_text('#!/bin/sh\nn=$#; i=0\nwhile [ $i -lt $n ]; do a=$1; shift; case $a in -cRp) a=-Rp;; -cp) a=-p;; esac; set -- "$@" "$a"; i=$((i+1)); done\nexec /bin/cp "$@"\n')
+        cp.chmod(0o755)
+        self.build()
+        self.assertEqual((self.out / self.FW).read_bytes(), (self.built / self.FW).read_bytes())
+        self.assertEqual((self.out / 'pso/applegpu_g18p/archive.metallib').read_bytes(), (self.pso / 'applegpu_g18p/archive.metallib').read_bytes())
+
+    def test_a_failed_final_rename_keeps_the_old_pipeline_archive(self):
+        self.build()
+        (self.pso / 'applegpu_g18p/archive.metallib').write_text('a newer archive')
+        self.failing_rename('pso.part')
+        result = self.build(expect=1)
+        self.assertIn('copy the pipeline archive', result.stdout + result.stderr)
+        self.assertEqual((self.out / 'pso/applegpu_g18p/archive.metallib').read_text(), self.BIG.replace('shader', 'pipeln'))
+        self.assertEqual(sorted(p.name for p in self.out.iterdir() if p.name.endswith(('.part', '.old'))), [])
+
+    def test_a_failed_final_rename_keeps_the_old_executable(self):
+        self.build()
+        (self.built / self.FW).write_text('a newer executable')
+        self.failing_rename(f'{self.FW}.part')
+        result = self.build(expect=1)
+        self.assertIn("copy the framework's executable", result.stdout + result.stderr)
+        self.assertEqual((self.out / self.FW).read_text(), self.BIG)
+        self.assertEqual(sorted(p.name for p in self.out.iterdir() if p.name.endswith(('.part', '.old'))), [])
+
+
 if __name__ == '__main__':
     unittest.main()

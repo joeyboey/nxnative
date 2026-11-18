@@ -352,7 +352,19 @@ fi
 # game's per-game resources into it, so one folder is one game: the pipeline archive (pso/, DM_PSO_BUNDLE) and the icon the shell's library shows.
 # The shader libraries are stripped from the framework (msl/ removed); their source metadata is recorded under .msl-cache/<id>.json.
 # The game files and add-on content stay out (data, Documents/games/<id>/)
+# Every copy into the framework is a clone of the build's own output (cp -c: on APFS the two share their blocks, on a file system without clones it is a plain copy), made under a temporary name
+# and renamed, so a failed or interrupted build leaves what was there. rsync writes a changed file anew: the executable and the pipeline archive were each a second copy on disk (LNPANDY/NX2Apple#422).
+# A file whose size and time, to the nanosecond, are its source's is left alone, as rsync left it
 if [ -n "$FRAMEWORK_ONLY" ]; then
+  same_file() { [ -f "$2" ] && [ ! -L "$2" ] && [ "$(stat -f '%z %Fm' "$1")" = "$(stat -f '%z %Fm' "$2")" ]; }   # cp -p keeps the time to the nanosecond: a rebuild in the same second is seen
+  clone_file() { same_file "$1" "$2" || { rm -rf -- "$2.part" && cp -cp -- "$1" "$2.part" && { [ ! -d "$2" ] || rm -rf -- "$2"; } && mv -f -- "$2.part" "$2"; } || { rm -rf -- "$2.part"; return 1; }; }
+  # A folder, whole (every file a clone). The old one is set aside until the new one is in place, and comes back when the last rename fails
+  clone_tree() {
+    rm -rf -- "$2.part" "$2.old"
+    cp -cRp -- "$1" "$2.part" || { rm -rf -- "$2.part"; return 1; }
+    if [ -e "$2" ] || [ -L "$2" ]; then mv -- "$2" "$2.old" || { rm -rf -- "$2.part"; return 1; }; fi
+    if mv -- "$2.part" "$2"; then rm -rf -- "$2.old"; else rm -rf -- "$2.part"; [ ! -e "$2.old" ] || mv -- "$2.old" "$2"; return 1; fi
+  }
   t "xcodebuild (Release, unsigned, the game framework $FW_NAME with its own host)"
   mkdir -p "$O" "$FRAMEWORK_ONLY" || die "mkdir $FRAMEWORK_ONLY"
   xcodebuild -project DmIOS.xcodeproj -target DmShellGame -configuration Release -sdk iphoneos \
@@ -364,7 +376,8 @@ if [ -n "$FRAMEWORK_ONLY" ]; then
   [ -f "$BUILT/$FW_NAME" ] || die "no built framework $BUILT"
   OUTFW=$FRAMEWORK_ONLY/$FW_NAME.framework; mkdir -p "$OUTFW"
   t "copying resources into $FW_NAME.framework"
-  rsync -a --delete --exclude /msl --exclude /pso --exclude /icon.png --exclude /AppIcon.png -- "$BUILT/" "$OUTFW/" || die "copy the framework to $OUTFW"
+  rsync -a --delete --exclude /msl --exclude /pso --exclude /icon.png --exclude /AppIcon.png --exclude "/$FW_NAME" -- "$BUILT/" "$OUTFW/" || die "copy the framework to $OUTFW"
+  clone_file "$BUILT/$FW_NAME" "$OUTFW/$FW_NAME" || die "copy the framework's executable to $OUTFW"
   rm -rf "$OUTFW/msl"
   LIB=$(lib_path "$MSL_IOS/$MSLDIR") || die "shader libraries $MSL_IOS/$MSLDIR"
   PROG_DATA=
@@ -446,7 +459,7 @@ with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
 target_json = os.path.join(cache_dir, f'{game}.json')
 os.replace(tmp_file, target_json)
 EOF
-  if [ -n "$PSO" ]; then mkdir -p "$OUTFW/pso" && rsync -a --delete -- "$PSO/" "$OUTFW/pso/" || die "copy the pipeline archive"; else rm -rf "$OUTFW/pso"; fi
+  if [ -n "$PSO" ]; then clone_tree "$PSO" "$OUTFW/pso" || die "copy the pipeline archive"; else rm -rf "$OUTFW/pso" "$OUTFW/pso.part" "$OUTFW/pso.old"; fi
   if [ -f "$ICON" ]; then
     sips -s format png -z 512 512 "$ICON" --out "$OUTFW/icon.png" > /dev/null || die "sips: cannot convert the icon $ICON"
     cp -f "$OUTFW/icon.png" "$OUTFW/AppIcon.png" || die "cp: cannot write $OUTFW/AppIcon.png"
