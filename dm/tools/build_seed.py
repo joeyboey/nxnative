@@ -484,7 +484,7 @@ def _discover_b_libs_in_dir(parent_dir):
     return sorted(found)
 
 
-def _stage_metal_sources(mac_shader_dir, work_dir, chain, staging_dir, quota, extra_msl_dir=None):
+def _stage_metal_sources(mac_shader_dir, work_dir, chain, staging_dir, quota, extra_msl_dir=None, gfx_api='nvn'):
     """Builds metal-sources/b-<chain>.img (or multi-program p<N>/b-<chain>.img) inside staging_dir.
     Returns inferred raw chain string if discovered."""
     src = os.fspath(mac_shader_dir) if mac_shader_dir else os.path.join(work_dir, 'shader', 'cache')
@@ -492,6 +492,9 @@ def _stage_metal_sources(mac_shader_dir, work_dir, chain, staging_dir, quota, ex
         return _norm_chain(chain)
     if os.path.islink(src):
         raise ValueError(f'symlink forbidden for mac_shader_dir: {src}')
+
+    if gfx_api != 'nvn':
+        return ''
 
     target_tag = _chain_tag(chain)
     metal_out_root = os.path.join(staging_dir, 'metal-sources')
@@ -563,7 +566,7 @@ def _stage_metal_sources(mac_shader_dir, work_dir, chain, staging_dir, quota, ex
     return inferred_chain
 
 
-def _stage_shader_ios(ios_src_dir, chain, staging_dir, quota):
+def _stage_shader_ios(ios_src_dir, chain, staging_dir, quota, gfx_api='nvn'):
     """Stages shader/ios/ into staging_dir (packing loose b-<chain> folders into b-<chain>.img if needed)."""
     dst_ios = os.path.join(staging_dir, 'shader', 'ios')
     os.makedirs(dst_ios, exist_ok=True)
@@ -605,6 +608,9 @@ def _stage_shader_ios(ios_src_dir, chain, staging_dir, quota):
             _stage_tree(entry.path, os.path.join(dst_ios, name), quota, allow_subdirs=True)
         elif entry.is_file(follow_symlinks=False):
             _link_or_copy_file(entry.path, os.path.join(dst_ios, name), quota)
+
+    if gfx_api != 'nvn':
+        return ''
 
     target_tag = _chain_tag(chain)
     all_b = sorted(set(b_dirs) | set(b_imgs))
@@ -678,6 +684,90 @@ def _find_registered_profile_dir(tid, profile_id=''):
     except OSError:
         pass
     return None, None
+
+
+def _has_valid_nvn_lib(dir_path):
+    if not dir_path or not os.path.isdir(dir_path) or os.path.islink(dir_path):
+        return False
+    for b_tag in _discover_b_libs_in_dir(dir_path):
+        if shader_lib.has_library(os.path.join(dir_path, b_tag)):
+            return True
+    return False
+
+
+def _infer_gfx_api(
+    explicit_api='',
+    prof_kv=None,
+    exefs_dir=None,
+    shader_dirs=(),
+    ios_dirs=(),
+    capture_roots=(),
+    profile_dirs=(),
+):
+    """Infers 'nvn', 'vulkan', or 'gl' from build artifacts, profile capture tables, or ExeFS symbols."""
+    raw = str(explicit_api or (prof_kv or {}).get('gfx_api') or '').strip().lower()
+    if raw in ('vulkan', 'gl'):
+        return raw
+
+    for d in ios_dirs:
+        if d and os.path.isfile(os.path.join(d, 'vk', 'vk_shaders.metallib')):
+            return 'vulkan'
+        if d and os.path.isfile(os.path.join(d, 'gl', 'gl_shaders.metallib')):
+            return 'gl'
+
+    for d in shader_dirs:
+        if d and os.path.isfile(os.path.join(d, 'vk', 'vk_shaders.metallib')):
+            return 'vulkan'
+        if d and os.path.isfile(os.path.join(d, 'gl', 'gl_shaders.metallib')):
+            return 'gl'
+
+    for c_root in capture_roots:
+        if c_root and _dir_has_visible_files(os.path.join(c_root, 'vk_capture')):
+            return 'vulkan'
+        if c_root and _dir_has_visible_files(os.path.join(c_root, 'gl_capture')):
+            return 'gl'
+
+    for p_dir in profile_dirs:
+        if p_dir and os.path.isfile(os.path.join(p_dir, 'vk_capture.tsv')):
+            return 'vulkan'
+        if p_dir and os.path.isfile(os.path.join(p_dir, 'gl_capture.tsv')):
+            return 'gl'
+
+    if any(_has_valid_nvn_lib(d) for d in list(ios_dirs) + list(shader_dirs)):
+        return 'nvn'
+
+    for d in shader_dirs:
+        if d and _dir_has_visible_files(os.path.join(d, 'pkg')):
+            return 'nvn'
+
+    main_path = os.path.join(exefs_dir, 'main') if exefs_dir else None
+    if main_path and os.path.isfile(main_path) and not os.path.islink(main_path):
+        try:
+            from dm.tools import nso as _nso_mod, nso_syms as _nso_syms
+            with open(main_path, 'rb') as mf:
+                raw_nso = mf.read()
+            if raw_nso[:4] == b'NSO0':
+                img = bytes(_nso_mod.load(raw_nso, main_path).image)
+                imports = {s for s, defined, _ in _nso_syms.dynsyms(img) if not defined}
+                vk = sum(1 for s in imports if re.match(r'vk[A-Z]', s) and s != 'vkGetInstanceProcAddr')
+                if vk > 0 and 'nvnBootstrapLoader' not in imports:
+                    return 'vulkan'
+                own_glslc = (
+                    'nvnBootstrapLoader' in imports
+                    and 'glslcCompile' in imports
+                    and bool(re.search(rb'#version [^\0]*\bvoid\s+main\s*\(', img))
+                )
+                if (
+                    'nvnBootstrapLoader' not in imports
+                    and 'eglCreateWindowSurface' in imports
+                    and b'glShaderSource' in img
+                    and not own_glslc
+                ):
+                    return 'gl'
+        except Exception:
+            pass
+
+    return raw if raw in ('nvn', 'vulkan', 'gl') else 'nvn'
 
 
 def _compute_inputs_digest(staging_dir, tid, pkg_ver, gfx_api, chain):
@@ -800,6 +890,19 @@ def inspect_seed(seed_dir_or_root, title_id=None):
     )
 
     gfx_api = str(seed.get('gfx_api') or 'nvn').strip().lower()
+    if gfx_api not in ('vulkan', 'gl'):
+        healed_api = _infer_gfx_api(
+            explicit_api=gfx_api,
+            exefs_dir=exefs_dir,
+            shader_dirs=(os.path.join(seed_dir, 'shader'),),
+            ios_dirs=(ios_dir,),
+            capture_roots=(os.path.join(seed_dir, 'captures'),),
+        )
+        if healed_api in ('vulkan', 'gl'):
+            gfx_api = healed_api
+            seed = dict(seed)
+            seed['gfx_api'] = healed_api
+            seed['chain'] = ''
     reason = None
     if not has_exefs:
         reason = 'missing or empty ExeFS directory'
@@ -807,7 +910,7 @@ def inspect_seed(seed_dir_or_root, title_id=None):
         reason = 'missing shader/pkg directory'
     elif not os.path.isdir(ios_dir):
         reason = 'missing shader/ios directory'
-    elif not has_shader_ios and not has_metal_sources:
+    elif gfx_api == 'nvn' and not has_shader_ios and not has_metal_sources:
         reason = 'seed has neither shader/ios outputs nor metal-sources'
     elif gfx_api == 'nvn' and not has_tables:
         reason = 'missing shader/tables/{c1_full.tsv, cb_extent.tsv}'
@@ -1044,12 +1147,7 @@ def save_seed(
             except (OSError, ValueError):
                 prev_seed = {}
 
-        # 6. Stage shader/ios/ and metal-sources/b-<chain>.img
-        gfx_api = str(meta_in.get('gfx_api') or prof_kv.get('gfx_api') or 'nvn').strip().lower()
-        if gfx_api not in ('nvn', 'vulkan', 'gl'):
-            gfx_api = 'nvn'
-
-        raw_chain = _norm_chain(meta_in.get('chain'))
+        # 6. Stage shader/ios/ and metal-sources/b-<chain>.img (or vk / gl Mac shader directories)
         ios_src = _extra_ios_dir
         if not ios_src:
             cand_ios = os.path.join(src_shader, 'ios')
@@ -1062,12 +1160,26 @@ def save_seed(
             elif prev_seed and _dir_has_visible_files(prev_ios) and not os.path.islink(prev_ios):
                 ios_src = prev_ios
 
-        inferred_ios_chain = _stage_shader_ios(ios_src, raw_chain, staging_dir, quota)
-        if not raw_chain and inferred_ios_chain:
+        gfx_api = _infer_gfx_api(
+            explicit_api=meta_in.get('gfx_api'),
+            prof_kv=prof_kv,
+            exefs_dir=os.path.join(staging_dir, 'ExeFS'),
+            shader_dirs=(src_shader, mac_shader_dir, os.path.join(target_dir, 'shader') if prev_seed else None),
+            ios_dirs=(ios_src, os.path.join(src_shader, 'ios'), os.path.join(target_dir, 'shader', 'ios') if prev_seed else None),
+            capture_roots=(os.path.join(staging_dir, 'captures'), ver_dir),
+            profile_dirs=(eff_profile_dir, reg_dir),
+        )
+        if gfx_api not in ('nvn', 'vulkan', 'gl'):
+            gfx_api = 'nvn'
+
+        raw_chain = _norm_chain(meta_in.get('chain')) if gfx_api == 'nvn' else ''
+
+        inferred_ios_chain = _stage_shader_ios(ios_src, raw_chain, staging_dir, quota, gfx_api=gfx_api)
+        if gfx_api == 'nvn' and not raw_chain and inferred_ios_chain:
             raw_chain = inferred_ios_chain
 
         if gfx_api == 'nvn':
-            inferred_mac_chain = _stage_metal_sources(mac_shader_dir, work_path, raw_chain, staging_dir, quota)
+            inferred_mac_chain = _stage_metal_sources(mac_shader_dir, work_path, raw_chain, staging_dir, quota, gfx_api=gfx_api)
             if not raw_chain and inferred_mac_chain:
                 raw_chain = inferred_mac_chain
             staged_metal = os.path.join(staging_dir, 'metal-sources')
@@ -1092,6 +1204,20 @@ def save_seed(
                         pass
         else:
             raw_chain = ''
+            layer_sub = 'vk' if gfx_api == 'vulkan' else 'gl'
+            src_layer = os.path.join(src_shader, layer_sub)
+            prev_layer = os.path.join(target_dir, 'shader', layer_sub)
+            if _dir_has_visible_files(src_layer) and not os.path.islink(src_layer):
+                _stage_tree(src_layer, os.path.join(dst_shader, layer_sub), quota, allow_subdirs=True)
+            elif prev_seed and _dir_has_visible_files(prev_layer) and not os.path.islink(prev_layer):
+                _stage_tree(prev_layer, os.path.join(dst_shader, layer_sub), quota, allow_subdirs=True)
+            for key_cand in (
+                os.path.join(src_shader, f'{layer_sub}.key'),
+                os.path.join(target_dir, 'shader', f'{layer_sub}.key') if prev_seed else '',
+            ):
+                if key_cand and os.path.isfile(key_cand) and not os.path.islink(key_cand):
+                    _link_or_copy_file(key_cand, os.path.join(dst_shader, f'{layer_sub}.key'), quota)
+                    break
 
         # 7. Stage shader/tables/{c1_full.tsv, cb_extent.tsv} (and optional shader tables)
         dst_tables = os.path.join(dst_shader, 'tables')
@@ -1488,12 +1614,12 @@ def stage_seed_to_work(seed_dir, work_dir, pkg_ver=None):
     work_shader = os.path.join(work_p, 'shader')
     os.makedirs(work_shader, exist_ok=True)
 
-    for sub in ('pkg', 'tables', 'ios'):
+    for sub in ('pkg', 'tables', 'ios', 'vk', 'gl'):
         s_sub = os.path.join(src_seed, 'shader', sub)
         if os.path.isdir(s_sub):
             _stage_tree(s_sub, os.path.join(work_shader, sub), quota, allow_subdirs=True)
 
-    for stamp_name in ('pkg.key', 'pkg.outputs.key', 'pso_pairs.tsv'):
+    for stamp_name in ('pkg.key', 'pkg.outputs.key', 'pso_pairs.tsv', 'vk.key', 'gl.key'):
         sp = os.path.join(src_seed, 'shader', stamp_name)
         if os.path.isfile(sp):
             _link_or_copy_file(sp, os.path.join(work_shader, stamp_name), quota)

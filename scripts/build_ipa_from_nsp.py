@@ -4077,6 +4077,21 @@ def _prepare_from_seed(args, from_seed_arg, seed_root, prefill_msl, gamemod, env
     if out_hint and out_hint.suffix == '.app' and out_hint.is_dir() and out_hint not in prefill_msl:
         prefill_msl.append(out_hint)
 
+    seed_gfx = (seed.get('gfx_api') or '').strip().lower()
+    if seed_gfx not in ('vulkan', 'gl'):
+        healed_gfx = build_seed._infer_gfx_api(
+            explicit_api=seed_gfx,
+            exefs_dir=Path(staged['extract_dir']) / 'ExeFS',
+            shader_dirs=(work / 'shader', seed_dir / 'shader'),
+            ios_dirs=(work / 'shader/ios', seed_dir / 'shader/ios'),
+            capture_roots=(Path(staged['extract_dir']), seed_dir / 'captures'),
+            profile_dirs=tuple(p for p in (g.dir if g else None, reg.dir if reg else None) if p),
+        )
+        if healed_gfx in ('vulkan', 'gl'):
+            seed_gfx = healed_gfx
+    if seed_gfx not in ('nvn', 'vulkan', 'gl'):
+        seed_gfx = 'nvn'
+
     return {
         'app': app,
         'nsp_dir': nsp_dir,
@@ -4091,7 +4106,7 @@ def _prepare_from_seed(args, from_seed_arg, seed_root, prefill_msl, gamemod, env
         'seed_dir': seed_dir,
         'seed': seed,
         'seed_romfs_id': seed.get('romfs_identity'),
-        'gfx': (seed.get('gfx_api') or 'nvn').strip().lower(),
+        'gfx': seed_gfx,
     }
 
 
@@ -4468,11 +4483,11 @@ def main(args=None):
     if uedec: decode_ue_shaders(repo, {v: dirs[v] for v in sv}, pkg_ver, patched, work, env, logs, g)
     sh = work / 'shader'
     if gfx == 'vulkan':   # the packed version's merged RomFS holds the SPIR-V files the game loads; a capture holds those it generates. A damaged copy (ALLOW_DAMAGED) is keyed by its files' times, as split_shaders keys it
-        cap = capture_shaders(repo, game, patched, work, env, logs, g, 'vk') if vkcap else None
+        cap = capture_shaders(repo, game, patched, work, env, logs, g, 'vk') if vkcap else ((game / 'vk_capture') if from_seed_arg is not None and (game / 'vk_capture').is_dir() else None)
         rom_root = rfs.source(game) if Path(str(rfs.source(game))).exists() else (game / 'RomFS')
         ios = build_vk_shaders(py, repo, [rom_root, game / 'ExeFS/main'] + dlc_roms + ([cap] if cap else []), sh, env, logs, g, mac=mac, provisional=bool(provisional or derived or ALLOW_DAMAGED), from_seed=from_seed_arg is not None)
     elif gfx == 'gl':   # the GLSL sources in the packed version's archives and in its main (the game compiles them at run time; the host finds each by the hash of its text), and a capture of those it puts together
-        cap = capture_shaders(repo, game, patched, work, env, logs, g, 'gl') if glcap else None
+        cap = capture_shaders(repo, game, patched, work, env, logs, g, 'gl') if glcap else ((game / 'gl_capture') if from_seed_arg is not None and (game / 'gl_capture').is_dir() else None)
         rom_root = rfs.source(game) if Path(str(rfs.source(game))).exists() else (game / 'RomFS')
         ios = build_gl_shaders(py, repo, [rom_root, game / 'ExeFS/main'] + dlc_roms + ([cap] if cap else []), sh, env, logs, g,
                                mac=mac, provisional=bool(provisional or derived or ALLOW_DAMAGED), fixed=src['gl_fixed'][0], from_seed=from_seed_arg is not None)
