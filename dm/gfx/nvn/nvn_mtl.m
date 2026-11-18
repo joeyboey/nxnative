@@ -16861,6 +16861,10 @@ static void copy_t2b(const p_copy_b2t *c, uint32_t size) {
     int is3d = c->tex->d.target == 2, nz = c->r.depth ? c->r.depth : 1;
     void *mb; uint64_t mo;
     if (!mtl_addr(c->src, img * nz, &mb, &mo)) { RED_ONCE(31, "texture→buffer copy destination is in no memory pool"); return; }
+    if (g_bc_cpu && nvn_fmt_bc(c->tex->d.format)) {
+        RED_ONCE(105, "texture→buffer copy from CPU-decoded BC texture is not supported");
+        return;
+    }
     sbw_note(c->src, img * nz, SBW_GPU);
     id<MTL4ComputeCommandEncoder> b = blit();
     if (is3d)
@@ -16934,7 +16938,10 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     int in_storage = 0; AP_B;
     id<MTLTexture> mt = tex_mtl_(t, &in_storage); AP_E(4);
     if (in_storage) { read_texels_storage(t, level, layer0, r, dst, row, img); return; }
-    if (!mt || !tex_level_ok(mt, level, "CPU readback")) { memset(dst, 0, img * nz); return; }
+    if (!mt || !tex_level_ok(mt, level, "CPU readback") || (g_bc_cpu && nvn_fmt_bc(t->d.format))) {
+        if (mt && g_bc_cpu && nvn_fmt_bc(t->d.format)) RED_ONCE(95, "CPU readback of CPU-decoded BC texture from GPU is not supported");
+        memset(dst, 0, img * nz); return;
+    }
     mtl_finish_gpu_at(WS_READTEX);
     id<MTLBuffer> buf = [g_dev newBufferWithLength:wb * hb * nz options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = enc_b_begin(cb);
@@ -16996,7 +17003,25 @@ static void copy_b2t(const p_copy_b2t *c, uint32_t size) {
     // Into Metal's order (rb_copy_shift): converted on the GPU into a staging area of the frame arena, which the blit copies from
     id<MTLBuffer> sb = (__bridge id<MTLBuffer>)mb; int shift = rb_copy_shift(c->tex, t);
     uint64_t gsrc = sb.gpuAddress + mo; size_t grow = row, gimg = img;   // the guest's bytes, the storage's order (gsb_store_buf)
-    if (shift) {
+    uint32_t bc_pf = 0; int bc_bpp = 0;
+    int bc_cpu = g_bc_cpu && nvn_bc_unpacked(c->tex->d.format, &bc_pf, &bc_bpp);
+    if (bc_cpu) {
+        if (g_cb && (pend_hits(c->src, img * nz) || sbw_hits(c->src, c->src + img * nz) || g_sbw_over)) {
+            uint64_t fence = mtl_sub_commit();
+            mtl_wait(fence, UINT64_MAX);
+            mtl_sub_begin();
+            mtl_addr(c->src, img * nz, &mb, &mo);
+            sb = (__bridge id<MTLBuffer>)mb;
+            gsrc = sb.gpuAddress + mo;
+        } else if (gw_live(c->src, c->src + img * nz)) {
+            mtl_finish_gpu_at(WS_FINISH);
+        }
+        size_t urow = (size_t)c->r.width * (size_t)bc_bpp, uimg = urow * (size_t)c->r.height;
+        id<MTLBuffer> ab; size_t ao = arena_alloc(uimg * (size_t)nz, &ab);
+        for (int z = 0; z < nz; z++)
+            nvn_bc_decode(c->tex->d.format, (const uint8_t *)sb.contents + mo + (size_t)z * img, row, c->r.width, c->r.height, (uint8_t *)ab.contents + ao + (size_t)z * uimg, urow);
+        sb = ab; mo = ao; row = urow; img = uimg;
+    } else if (shift) {
         size_t wb = (size_t)((c->r.width + bw - 1) / bw) * bpb; id<MTLBuffer> ab; size_t ao = arena_alloc(wb * rows * nz, &ab);
         if (rb_swap_gpu(sb.gpuAddress + mo, row, img, ab.gpuAddress + ao, wb, wb * rows, wb, rows, nz, shift)) { sb = ab; mo = ao; row = wb; img = wb * rows; }
         else RED_ONCE(7, "RGB565-family buffer→texture copy left in the guest's order: red and blue exchanged");

@@ -81,10 +81,79 @@ static void views(void) {
         mtl_drain();
     }
 }
+static void copies_and_readback(void) {
+    uint32_t unpacked=0; int bpp=0;
+    CHECK("BC1 has decoded format", nvn_bc_unpacked(0x41, &unpacked, &bpp));
+    tex_t t = {.magic=MAGIC('T','E','X',0), .serial=1000200};
+    t.d = (nvn_texdesc){.target=1, .format=0x41, .width=4, .height=4, .depth=1, .levels=1, .samples=1};
+    MTLTextureDescriptor *td = tex_desc(&t, 0); td.storageMode = MTLStorageModeShared;
+    id<MTLTexture> mt = [g_dev newTextureWithDescriptor:td];
+    CHECK("decoded texture allocated", mt != nil);
+    serial_put(t.serial, mt);
+
+    size_t buf_sz = 4096;
+    void *buf_mem = NULL;
+    if (posix_memalign(&buf_mem, getpagesize(), buf_sz)) abort();
+    memset(buf_mem, 0, buf_sz);
+    mtl_pool_add(buf_mem, buf_sz);
+
+    // BC1 block: red = 0xf800, blue = 0x001f; all indices 0 -> red
+    uint8_t *bc1_src = (uint8_t *)buf_mem;
+    bc1_src[0] = 0x00; bc1_src[1] = 0xf8; bc1_src[2] = 0x1f; bc1_src[3] = 0x00;
+    bc1_src[4] = 0x00; bc1_src[5] = 0x00; bc1_src[6] = 0x00; bc1_src[7] = 0x00;
+
+    p_copy_b2t cb2t = {.tex=&t, .src=(uint64_t)(uintptr_t)buf_mem, .r={0, 0, 0, 4, 4, 1}};
+    mtl_sub_begin();
+    copy_b2t(&cb2t, 0);
+    finish();
+
+    uint8_t pixel[4] = {0};
+    [mt getBytes:pixel bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0];
+    CHECK("copy_b2t decoded BC1 red texel", pixel[0] == 255 && pixel[1] == 0 && pixel[2] == 0 && pixel[3] == 255);
+
+    // GPU-copy-to-BC-copy ordering regression:
+    // With BC1 source initially containing red, mtl_sub_copy queues blue over that source before copy_b2t.
+    // copy_b2t must resolve pending GPU writes before CPU decode so that the copied texture is blue
+    // and guest memory preserves the compressed blue BC1 block.
+    uint8_t *bc1_blue = (uint8_t *)buf_mem + 2048;
+    bc1_blue[0] = 0x1f; bc1_blue[1] = 0x00; bc1_blue[2] = 0x00; bc1_blue[3] = 0x00;
+    bc1_blue[4] = 0x00; bc1_blue[5] = 0x00; bc1_blue[6] = 0x00; bc1_blue[7] = 0x00;
+
+    mtl_sub_begin();
+    mtl_sub_copy((uint64_t)(uintptr_t)bc1_blue, (uint64_t)(uintptr_t)buf_mem, 64);
+    copy_b2t(&cb2t, 0);
+    finish();
+
+    memset(pixel, 0, sizeof(pixel));
+    [mt getBytes:pixel bytesPerRow:16 fromRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0];
+    CHECK("copy_b2t decoded BC1 blue texel after pending GPU copy", pixel[0] == 0 && pixel[1] == 0 && pixel[2] == 255 && pixel[3] == 255);
+    CHECK("source buffer preserves compressed BC1 blue block", bc1_src[0] == 0x1f && bc1_src[1] == 0x00);
+
+    p_copy_b2t ct2b = {.tex=&t, .src=(uint64_t)(uintptr_t)buf_mem, .r={0, 0, 0, 4, 4, 1}};
+    mtl_sub_begin();
+    copy_t2b(&ct2b, 0);
+    finish();
+    CHECK("copy_t2b on decoded BC texture returns safely", 1);
+
+    uint8_t dst[64];
+    memset(dst, 0xaa, sizeof(dst));
+    NVNcopyRegion r = {0, 0, 0, 4, 4, 1};
+    mtl_read_texels(&t, 0, 0, &r, dst, 16, 64);
+    int all_zero = 1;
+    for (size_t i = 0; i < sizeof(dst); i++) if (dst[i] != 0) { all_zero = 0; break; }
+    CHECK("mtl_read_texels on decoded BC texture zeroes dst", all_zero);
+
+    mtl_tex_release(&t);
+    mtl_drain();
+    mtl_pool_del(buf_mem);
+    mtl_drain();
+    free(buf_mem);
+}
 int main(int argc,char **argv) { @autoreleasepool {
     mtl_init(); g_bc_cpu=1;
     CHECK("GPU deswizzle is enabled for the regression",g_nvn_deswz_gpu);
     if(argc<2||strcmp(argv[1],"views"))for(int direct=0;direct<2;direct++){uploads(0x41,4,direct);uploads(0x49,1,direct);uploads(0x4b,2,direct);}
     if(argc<2||strcmp(argv[1],"uploads"))views();
+    copies_and_readback();
     printf("t_bc_cpu: %d checks, %d failed\n",checks,failed); return failed!=0;
 }}
