@@ -12,32 +12,32 @@ static void finish(void) {
     CHECK("upload submission completes",mtl_wait(mtl_sub_commit(),5000000000ull));
     CHECK("upload has no GPU error",!mtl_last_commit_error());
 }
-static void uploads(int format, int bpp, int direct) {
+static void uploads(int format, int bpp, int direct, unsigned w0, unsigned h0) {   // w0 x h0 of the first level: a large one takes the multi-core decode (nvn_bc_decode_par)
     g_direct_upload_on=direct;
     static uint64_t serial=990000;
     tex_t t={.magic=MAGIC('T','E','X',0),.serial=serial++,.has_layout=1};
-    t.d=(nvn_texdesc){.target=4,.format=format,.width=7,.height=5,.depth=2,.levels=3,.samples=1};
+    t.d=(nvn_texdesc){.target=4,.format=format,.width=w0,.height=h0,.depth=2,.levels=3,.samples=1};
     nvn_tex_layout(&t.d,&t.L);
     size_t poolsize=(t.L.size+4096+getpagesize()-1)&~(size_t)(getpagesize()-1);
     void *mem=NULL; if(posix_memalign(&mem,getpagesize(),poolsize))abort(); memset(mem,0,poolsize);
     pool_t pool={.magic=MAGIC('P','O','O','L'),.mem=mem,.size=poolsize,.flags=NVN_MEMORY_POOL_FLAGS_CPU_UNCACHED|NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
     t.pool=&pool; t.mem=(uint8_t*)mem+4096;
     mtl_pool_add(mem,poolsize); nvn_dirty_add_range(mem,poolsize);
-    size_t bytes=0; for(unsigned l=0;l<3;l++)bytes+=(size_t)MAX(7u>>l,1u)*MAX(5u>>l,1u)*2*bpp;
+    size_t bytes=0; for(unsigned l=0;l<3;l++)bytes+=(size_t)MAX(w0>>l,1u)*MAX(h0>>l,1u)*2*bpp;
     uint8_t *expected=malloc(bytes);
     id<MTLBuffer> readback=[g_dev newBufferWithLength:bytes+512 options:MTLResourceStorageModeShared];
     for(unsigned round=0;round<2;round++) {
         dm_guest_write_prepare(mem,poolsize); size_t off=0;
         for(unsigned l=0;l<3;l++)for(unsigned a=0;a<2;a++) {
-            unsigned w=MAX(7u>>l,1u),h=MAX(5u>>l,1u),nb=((w+3)/4)*((h+3)/4);
+            unsigned w=MAX(w0>>l,1u),h=MAX(h0>>l,1u),nb=((w+3)/4)*((h+3)/4);
             unsigned bb=format==0x41||format==0x49?8:16;
-            uint8_t blocks[64]={0},pixel[4]={0};
+            uint8_t *blocks=calloc(nb,bb),pixel[4]={0};
             for(unsigned i=0;i<nb;i++) {
                 uint8_t *b=blocks+i*bb;
                 if(format==0x41) { b[0]=round?0xe0:0; b[1]=round?7:0xf8; pixel[round?1:0]=255; pixel[3]=255; }
                 else { b[0]=(uint8_t)(200+round+a+l); pixel[0]=b[0]; if(format==0x4b){b[8]=100+round+a+l;pixel[1]=b[8];} }
             }
-            CHECK("compressed blocks swizzle",!nvn_swizzle(&t.d,l,a,blocks,((w+3)/4)*bb,t.mem));
+            CHECK("compressed blocks swizzle",!nvn_swizzle(&t.d,l,a,blocks,((w+3)/4)*bb,t.mem)); free(blocks);
             for(unsigned i=0;i<w*h;i++)memcpy(expected+off+(size_t)i*bpp,pixel,bpp);
             off+=(size_t)w*h*bpp;
         }
@@ -46,7 +46,7 @@ static void uploads(int format, int bpp, int direct) {
         CHECK("decoded mip count",image.mipmapLevelCount==3); CHECK("decoded array layers",image.arrayLength==2);
         id<MTLCommandBuffer> cb=q_cb(); id<MTLBlitCommandEncoder> enc=[cb blitCommandEncoder]; off=0;
         for(unsigned l=0;l<3;l++)for(unsigned a=0;a<2;a++) {
-            unsigned w=MAX(7u>>l,1u),h=MAX(5u>>l,1u);
+            unsigned w=MAX(w0>>l,1u),h=MAX(h0>>l,1u);
             [enc copyFromTexture:image sourceSlice:a sourceLevel:l sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(w,h,1) toBuffer:readback destinationOffset:256+off destinationBytesPerRow:w*bpp destinationBytesPerImage:w*h*bpp];
             off+=(size_t)w*h*bpp;
         }
@@ -152,7 +152,7 @@ static void copies_and_readback(void) {
 int main(int argc,char **argv) { @autoreleasepool {
     mtl_init(); g_bc_cpu=1;
     CHECK("GPU deswizzle is enabled for the regression",g_nvn_deswz_gpu);
-    if(argc<2||strcmp(argv[1],"views"))for(int direct=0;direct<2;direct++){uploads(0x41,4,direct);uploads(0x49,1,direct);uploads(0x4b,2,direct);}
+    if(argc<2||strcmp(argv[1],"views"))for(int direct=0;direct<2;direct++){uploads(0x41,4,direct,7,5);uploads(0x49,1,direct,7,5);uploads(0x4b,2,direct,7,5);uploads(0x41,4,direct,600,300);uploads(0x4b,2,direct,515,259);}
     if(argc<2||strcmp(argv[1],"uploads"))views();
     copies_and_readback();
     printf("t_bc_cpu: %d checks, %d failed\n",checks,failed); return failed!=0;

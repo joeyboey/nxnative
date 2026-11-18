@@ -6,6 +6,8 @@
 #include "nvn_bcdec.h"
 #include <math.h>
 #include <string.h>
+#include <dispatch/dispatch.h>
+#include <unistd.h>
 
 enum { R8Unorm = 10, R8Snorm = 12, RG8Unorm = 30, RG8Snorm = 32, RGBA8Unorm = 70, RGBA8Unorm_sRGB = 71, RGB9E5Float = 93, RGBA16Float = 115 };
 static int g_bc6h_rgb9e5;   // BC6H into RGB9E5Float, 4 bytes per pixel instead of 8 (nvn_bcdec.h)
@@ -84,5 +86,22 @@ int nvn_bc_decode(uint32_t f, const uint8_t *src, size_t pitch, uint32_t w, uint
         block(f, b, tmp, 4 * bpp);   // 边上不满 4×4 的块：先解到临时块再拷需要的部分 | blocks at the edge that are not a full 4×4: decode into a temporary block first, then copy the needed part
         for (uint32_t y = 0; y < ch; y++) memcpy(o + y * dpitch, tmp + y * 4 * bpp, cw * bpp);
     }
+    return 0;
+}
+
+// Block rows split into chunks of at least 16 (64 pixel rows) and at most 4 per core: each chunk is a band of whole block rows, so the src / dst offsets of a band are those
+// of its first block row, the bands write disjoint pixel rows, and only the last band can end in a partial block row (nvn_bc_decode trims it as before). Workers share no mutable
+// state: src is read only, block() reads g_bc6h_rgb9e5 (set before the first texture) and uses its own stack. Under 256×256 pixels the thread handoff costs more than it saves
+int nvn_bc_decode_par(uint32_t f, const uint8_t *src, size_t pitch, uint32_t w, uint32_t h, uint8_t *dst, size_t dpitch) {
+    uint32_t pf; int bpp; if (!nvn_bc_unpacked(f, &pf, &bpp)) return -1;
+    uint32_t rows = (h + 3) / 4;
+    if ((uint64_t)w * h < 256 * 256 || rows < 32) return nvn_bc_decode(f, src, pitch, w, h, dst, dpitch);
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN); if (ncpu < 1) ncpu = 1; if (ncpu > 16) ncpu = 16;
+    uint32_t per = (rows + (uint32_t)ncpu * 4 - 1) / ((uint32_t)ncpu * 4); if (per < 16) per = 16;
+    uint32_t bands = (rows + per - 1) / per;
+    dispatch_apply(bands, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t i) {   // returns when every band is done, also on the encode thread (DM_NVN_ENC_THREAD): the workers take no lock
+        uint32_t r0 = (uint32_t)i * per, y0 = r0 * 4, bh = h - y0 < per * 4 ? h - y0 : per * 4;
+        nvn_bc_decode(f, src + (size_t)r0 * pitch, pitch, w, bh, dst + (size_t)y0 * dpitch, dpitch);
+    });
     return 0;
 }

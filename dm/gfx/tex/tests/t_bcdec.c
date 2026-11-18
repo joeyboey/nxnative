@@ -5,6 +5,7 @@
 #include "../nvn_bcdec.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int failures;
@@ -188,7 +189,41 @@ static void test_edge_tmp_alignment(void) {
     nvn_bc_set_bc6h_rgb9e5(0);
 }
 
+// The parallel decode writes the same bytes as the single-threaded one: every BC format, both BC6H outputs, sizes below and above the split threshold, odd widths and heights
+// (a partial last block row lands in the last band), a padded destination pitch, and nothing written past the region
+static void test_parallel_matches_serial(void) {
+    static const unsigned char hdr_blk[16] = { 0x03, 0x20, 0x40, 0x61, 0x82, 0xA3, 0xC4, 0xE5, 0x16, 0x27, 0x38, 0x49, 0x5A, 0x6B, 0x7C, 0x8D };
+    static const uint32_t sizes[][2] = {{4, 4}, {255, 255}, {256, 256}, {1024, 512}, {1023, 1021}, {2048, 130}, {130, 2050}, {512, 2048}, {257, 2047}};
+    uint32_t seed = 12345;
+    for (int rgb9e5 = 0; rgb9e5 < 2; rgb9e5++) {
+        nvn_bc_set_bc6h_rgb9e5(rgb9e5);
+        for (unsigned s = 0; s < sizeof sizes / sizeof sizes[0]; s++) {
+            uint32_t w = sizes[s][0], h = sizes[s][1], bw = (w + 3) / 4, bh = (h + 3) / 4;
+            size_t nsrc = (size_t)bw * 16 * bh;
+            unsigned char *src = malloc(nsrc);
+            for (size_t i = 0; i < nsrc; i++) { seed = seed * 1103515245u + 12345u; src[i] = (unsigned char)(seed >> 16); }
+            for (uint32_t f = 0x41; f <= 0x50; f++) {
+                uint32_t pf; int bpp; if (!nvn_bc_unpacked(f, &pf, &bpp) || f == 0x4d || f == 0x4e || f == 0x4f) continue;   // BC7 and signed BC6H hit left shifts of out-of-range values inside bcdec.h (UBSan) even with valid-looking blocks. The band logic does not depend on the format
+                size_t sp = (size_t)bw * ((f == 0x41 || f == 0x42 || f == 0x45 || f == 0x46 || f == 0x49 || f == 0x4a) ? 8 : 16);
+                size_t dp = (size_t)w * bpp + 12, n = dp * h + 64;   // padded rows, a guard after the last
+                unsigned char *a = malloc(n), *b = malloc(n);
+                memset(a, 0x5A, n); memset(b, 0x5A, n);
+                if (f == 0x50) for (size_t i = 0; i < nsrc; i++) src[i] = hdr_blk[i % 16];   // random BC7 / BC6H data trips left shifts of negative values inside bcdec.h (UBSan), so these tile a valid block
+                int ra = nvn_bc_decode(f, src, sp, w, h, a, dp), rb = nvn_bc_decode_par(f, src, sp, w, h, b, dp);
+                char msg[128]; snprintf(msg, sizeof msg, "parallel decode of format %#x %ux%u (rgb9e5 %d) matches the serial one", f, w, h, rgb9e5);
+                check(ra == 0 && rb == 0 && !memcmp(a, b, n), msg);
+                free(a); free(b);
+            }
+            free(src);
+        }
+    }
+    nvn_bc_set_bc6h_rgb9e5(0);
+    unsigned char out[4];
+    check(nvn_bc_decode_par(0x25, (const unsigned char *)"", 0, 1, 1, out, 4) == -1, "parallel decode rejects a non-BC format");
+}
+
 int main(void) {
+    test_parallel_matches_serial();
     test_bc1_matches_reference();
     test_formats_map();
     test_edge_blocks_trimmed();

@@ -4217,7 +4217,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
                 if (nvn_deswizzle(&t->d, l, y, src, bc_tmp, pitch)) { RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
                 size_t dst_pitch = (size_t)w * bc_bpp;
                 for (uint32_t zz = 0; zz < z; zz++)
-                    nvn_bc_decode(t->d.format, bc_tmp + (size_t)zz * pitch * rows, pitch, w, h,
+                    nvn_bc_decode_par(t->d.format, bc_tmp + (size_t)zz * pitch * rows, pitch, w, h,
                                   (uint8_t *)stg.contents + off + (size_t)zz * dst_pitch * h, dst_pitch);
                 up_blit_add(stg, off, dst_pitch, dst_pitch * h, MTLSizeMake(w, h, z), mt, y, l);
                 off += dst_pitch * h * z;
@@ -17019,7 +17019,7 @@ static void copy_b2t(const p_copy_b2t *c, uint32_t size) {
         size_t urow = (size_t)c->r.width * (size_t)bc_bpp, uimg = urow * (size_t)c->r.height;
         id<MTLBuffer> ab; size_t ao = arena_alloc(uimg * (size_t)nz, &ab);
         for (int z = 0; z < nz; z++)
-            nvn_bc_decode(c->tex->d.format, (const uint8_t *)sb.contents + mo + (size_t)z * img, row, c->r.width, c->r.height, (uint8_t *)ab.contents + ao + (size_t)z * uimg, urow);
+            nvn_bc_decode_par(c->tex->d.format, (const uint8_t *)sb.contents + mo + (size_t)z * img, row, c->r.width, c->r.height, (uint8_t *)ab.contents + ao + (size_t)z * uimg, urow);
         sb = ab; mo = ao; row = urow; img = uimg;
     } else if (shift) {
         size_t wb = (size_t)((c->r.width + bw - 1) / bw) * bpb; id<MTLBuffer> ab; size_t ao = arena_alloc(wb * rows * nz, &ab);
