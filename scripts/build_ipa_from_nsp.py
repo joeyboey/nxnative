@@ -3785,12 +3785,14 @@ def report_fix_coverage(patched, mods, reg):
 
 def report_profile_status(g, reg, pkg_ver, derived, provisional, artifact='IPA', patched=None):
     """Keep build-specific warnings visible for the IPA, the Xcode project and a Mac-only build"""
-    disp = g.builds()[pkg_ver]['display'] if derived else ''
+    builds = g.builds() if derived else {}
+    build_row = builds.get(pkg_ver, {})
+    disp = build_row.get('display', '') if derived else ''
     if derived:   # unknown builds do not inherit fixed addresses; opt-in function matches are reported by the rewriter
         known = {(m, b) for row in reg.builds().values() for m, b in row.items() if m != 'display'}
-        other = [m for m, b in g.builds()[pkg_ver].items() if m != 'display' and (m, b) not in known]
-        registered_builds = ", ".join(f'{v} {b["display"]}' for v, b in reg.builds().items())
-        if g.title_id == reg.title_id and g.builds() == reg.builds():
+        other = [m for m, b in build_row.items() if m != 'display' and (m, b) not in known]
+        registered_builds = ", ".join(f'{v} {b.get("display", "")}' for v, b in reg.builds().items())
+        if g.title_id == reg.title_id and builds == reg.builds():
             say(f'this {artifact} uses the registered {pkg_ver} ({disp}) builds and every fix for them, with derived shader tables ({derived})')
         elif g.title_id != reg.title_id and not other and pkg_ver in reg.builds():   # a registered build under another title ID (same_build): every fix applies
             say(f'this {artifact} is game profile {reg.id}\'s {pkg_ver} ({disp}) under title ID {g.title_id:016X}: its settings and every fix for its builds, with shaders split from this title\'s own files')
@@ -3930,6 +3932,19 @@ def _persist_build_seed(seed_root, app, g, provisional, derived, pkg_ver, app_na
             control_path=ctrl_p,
             icon_path=icon_p,
         )
+        if not provisional and not derived:
+            for cand_id in dict.fromkeys((g.id, tid_hex, tid_hex.lower())):
+                if not cand_id:
+                    continue
+                stale_prof = Path(work) / 'profile' / cand_id
+                if stale_prof.exists() and not stale_prof.is_symlink():
+                    try:
+                        if stale_prof.resolve() != Path(g.dir).resolve():
+                            rmtree(stale_prof)
+                            rmtree(derived_key(stale_prof))
+                            rmtree(derived_split_key(stale_prof))
+                    except OSError:
+                        pass
     except (OSError, ValueError, TypeError) as e:
         say(f'[RED] build seed cache skipped: {e}')
 
@@ -4056,16 +4071,43 @@ def _prepare_from_seed(args, from_seed_arg, seed_root, prefill_msl, gamemod, env
     own = own_profile_folders(args, nsp_dir, app)
     repo_g = gamemod.by_title(app, own)
     staged_prof = staged.get('profile_dir')
-    if staged_prof and Path(staged_prof).is_dir():
-        _add_games_dir(env, Path(staged_prof).parent, prioritize=bool(repo_g))
-        g = gamemod.load(Path(staged_prof).name)
-        reg = repo_g or g
-        if profile_kind == 'provisional':
-            provisional = True
-            shadowed = bool(repo_g)
-        elif profile_kind == 'derived':
-            derived = 'seeded derived profile'
+    staged_prof_path = Path(staged_prof) if staged_prof else None
+    if staged_prof_path and (staged_prof_path / 'game.tsv').is_file():
+        staged_g = gamemod.Game(staged_prof_path)
+        staged_builds = staged_g.builds()
+        if (staged_builds or profile_kind == 'derived') and pkg_ver not in staged_builds:
+            rmtree(staged_prof_path)
+            rmtree(derived_key(staged_prof_path))
+            rmtree(derived_split_key(staged_prof_path))
+            staged_desc = ', '.join(
+                sorted(staged_builds, key=lambda v: (0, int(v[1:])) if v.startswith('v') and v[1:].isdigit() else (1, v))
+            ) or 'no builds'
+            if repo_g and pkg_ver in repo_g.builds():
+                say(
+                    f'seeded profile copy ({staged_prof_path}) describes {staged_desc}, '
+                    f'but seed package is {pkg_ver}: dropped stale copy and falling back to registered profile {repo_g.id}'
+                )
+                g = repo_g
+                reg = repo_g
+                derived = False
+                provisional = False
+            else:
+                raise BuildError(
+                    f'build seed profile describes {staged_desc}, but seed package is {pkg_ver}. '
+                    'Rebuild the game from game packages to update the profile cache'
+                )
+        else:
+            _add_games_dir(env, staged_prof_path.parent, prioritize=bool(repo_g))
+            g = gamemod.load(staged_prof_path.name)
+            reg = repo_g or g
+            if profile_kind == 'provisional':
+                provisional = True
+                shadowed = bool(repo_g)
+            elif profile_kind == 'derived':
+                derived = 'seeded derived profile'
     else:
+        if staged_prof_path and staged_prof_path.exists():
+            rmtree(staged_prof_path)
         g = repo_g or gamemod.load(profile_id)
         reg = g
 

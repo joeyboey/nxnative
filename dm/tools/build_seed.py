@@ -60,6 +60,27 @@ _EMPTY_TABLE_HEADERS = {
     'c1_full.tsv': '# empty table placeholder\n',
     'cb_extent.tsv': '# empty table placeholder\n',
 }
+_REPARSE_ATTR = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x0400)
+
+
+def _is_symlink_or_reparse(path, st=None):
+    """Returns True for symlinks and Windows directory reparse points (e.g. NTFS junctions)."""
+    if os.path.islink(path):
+        return True
+    if st is None:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    if stat.S_ISDIR(st.st_mode) and bool(int(getattr(st, 'st_file_attributes', 0) or 0) & _REPARSE_ATTR):
+        return True
+    return False
+
+
+def _dir_loop_key(path, st):
+    """Returns a stable directory identity key, falling back to realpath when st_ino == 0."""
+    if getattr(st, 'st_ino', 0):
+        return ('ino', getattr(st, 'st_dev', 0), st.st_ino)
+    return ('path', os.path.normcase(os.path.realpath(path)))
 
 
 class _Quota:
@@ -207,7 +228,7 @@ def _link_or_copy_file(src, dst, quota):
     src_path = os.fspath(src)
     dst_path = os.fspath(dst)
     st = os.lstat(src_path)
-    if stat.S_ISLNK(st.st_mode):
+    if _is_symlink_or_reparse(src_path, st):
         raise ValueError(f'symlink forbidden in build seed input: {src_path}')
     if not stat.S_ISREG(st.st_mode):
         raise ValueError(f'non-regular file forbidden in build seed input: {src_path}')
@@ -256,14 +277,14 @@ def _stage_tree(src_dir, dst_dir, quota, allow_subdirs=True, skip_names=(), _anc
     src_path = os.fspath(src_dir)
     dst_path = os.fspath(dst_dir)
     st = os.lstat(src_path)
-    if stat.S_ISLNK(st.st_mode):
+    if _is_symlink_or_reparse(src_path, st):
         raise ValueError(f'symlink directory forbidden: {src_path}')
     if not stat.S_ISDIR(st.st_mode):
         raise ValueError(f'expected directory: {src_path}')
     if _ancestors is None:
         _assert_not_overlapping_dirs(src_path, dst_path)
         _ancestors = set()
-    dev_ino = (st.st_dev, st.st_ino)
+    dev_ino = _dir_loop_key(src_path, st)
     if dev_ino in _ancestors:
         raise ValueError(f'recursive directory cycle detected at {src_path}')
     next_ancestors = _ancestors | {dev_ino}
@@ -277,7 +298,7 @@ def _stage_tree(src_dir, dst_dir, quota, allow_subdirs=True, skip_names=(), _anc
         entries = sorted(it, key=lambda e: e.name)
 
     for entry in entries:
-        if entry.is_symlink():
+        if entry.is_symlink() or _is_symlink_or_reparse(entry.path):
             raise ValueError(f'symlink forbidden inside tree: {entry.path}')
         name = entry.name
         if name in ('.DS_Store',) or '.tmp' in name or name in skip_names:
@@ -297,14 +318,14 @@ def _stage_tree(src_dir, dst_dir, quota, allow_subdirs=True, skip_names=(), _anc
 def _verify_no_symlinks_or_unsafe_names(root_dir):
     """Walks root_dir without following symlinks and returns (ok, reason, total_bytes)."""
     st = os.lstat(root_dir)
-    if stat.S_ISLNK(st.st_mode):
+    if _is_symlink_or_reparse(root_dir, st):
         return False, f'seed path is a symlink: {root_dir}', 0
     if not stat.S_ISDIR(st.st_mode):
         return False, f'seed path is not a directory: {root_dir}', 0
     total_bytes = 0
     total_entries = 0
     stack = [root_dir]
-    visited = {(st.st_dev, st.st_ino)}
+    visited = {_dir_loop_key(root_dir, st)}
     while stack:
         cur = stack.pop()
         try:
@@ -324,10 +345,20 @@ def _verify_no_symlinks_or_unsafe_names(root_dir):
                 est = entry.stat(follow_symlinks=False)
             except OSError as exc:
                 return False, f'cannot stat {entry.path}: {exc}', total_bytes
-            if stat.S_ISLNK(est.st_mode):
+            if entry.is_symlink() or _is_symlink_or_reparse(entry.path, est):
                 return False, f'symlink forbidden inside seed: {entry.path}', total_bytes
             if stat.S_ISDIR(est.st_mode):
-                key = (est.st_dev, est.st_ino)
+                # Re-stat directories via os.lstat: Windows DirEntry.stat(follow_symlinks=False)
+                # returns (0, 0) for st_dev/st_ino from WIN32_FIND_DATA.
+                try:
+                    lst = os.lstat(entry.path)
+                except OSError as exc:
+                    return False, f'cannot stat {entry.path}: {exc}', total_bytes
+                if _is_symlink_or_reparse(entry.path, lst):
+                    return False, f'symlink forbidden inside seed: {entry.path}', total_bytes
+                if not stat.S_ISDIR(lst.st_mode):
+                    return False, f'special file forbidden inside seed: {entry.path}', total_bytes
+                key = _dir_loop_key(entry.path, lst)
                 if key in visited:
                     return False, f'directory loop inside seed: {entry.path}', total_bytes
                 visited.add(key)
@@ -662,6 +693,26 @@ def _read_game_tsv_kv(tsv_path):
             if k not in kv:
                 kv[k] = v
     return kv
+
+
+def _read_game_tsv_build_versions(tsv_path):
+    """Extracts all build version keys (e.g. {'v0', 'v851968'}) from a game.tsv file."""
+    versions = set()
+    if not tsv_path or not os.path.isfile(tsv_path) or os.path.islink(tsv_path):
+        return versions
+    try:
+        with open(tsv_path, 'r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                if not line.strip() or line.lstrip().startswith('#'):
+                    continue
+                parts = line.split('\t')
+                if len(parts) >= 2 and parts[0].strip() == 'build':
+                    ver = parts[1].strip()
+                    if ver:
+                        versions.add(ver)
+    except OSError:
+        pass
+    return versions
 
 
 def _find_registered_profile_dir(tid, profile_id=''):
@@ -1069,25 +1120,51 @@ def save_seed(
         # 4. Discover / stage optional derived or provisional profile/<gid>/
         profile_id = str(meta_in.get('profile_id') or '').strip()
         profile_kind = str(meta_in.get('profile_kind') or '').strip()
-        eff_profile_dir = os.fspath(profile_dir) if profile_dir else None
-        if not eff_profile_dir:
+        explicit_profile_dir = os.fspath(profile_dir) if profile_dir else None
+        eff_profile_dir = explicit_profile_dir
+        discovered_work_prof = False
+        if not eff_profile_dir and profile_kind != 'registered':
             work_prof_root = os.path.join(work_path, 'profile')
             if os.path.isdir(work_prof_root) and not os.path.islink(work_prof_root):
                 with os.scandir(work_prof_root) as it:
                     pdirs = sorted(
-                        (e for e in it if e.is_dir(follow_symlinks=False) and not e.name.startswith('.')),
-                        key=lambda e: e.name,
+                        (
+                            e
+                            for e in it
+                            if e.is_dir(follow_symlinks=False)
+                            and not e.name.startswith('.')
+                            and os.path.isfile(os.path.join(e.path, 'game.tsv'))
+                        ),
+                        key=lambda e: (0 if e.name in (profile_id, tid) else 1, e.name),
                     )
                 if pdirs:
                     eff_profile_dir = pdirs[0].path
+                    discovered_work_prof = True
                     if not profile_id:
                         profile_id = pdirs[0].name
 
         reg_id, reg_dir = _find_registered_profile_dir(tid, profile_id=profile_id)
+        if not reg_dir and discovered_work_prof and profile_id:
+            reg_id, reg_dir = _find_registered_profile_dir(tid, profile_id='')
+        reg_builds = _read_game_tsv_build_versions(os.path.join(reg_dir, 'game.tsv')) if reg_dir else set()
+
         prof_kv = {}
         if eff_profile_dir and os.path.exists(eff_profile_dir):
             if os.path.islink(eff_profile_dir):
                 raise ValueError(f'symlink forbidden for profile_dir: {eff_profile_dir}')
+            eff_builds = _read_game_tsv_build_versions(os.path.join(eff_profile_dir, 'game.tsv'))
+            if eff_builds and pkg_ver not in eff_builds:
+                if discovered_work_prof and reg_dir and pkg_ver in reg_builds:
+                    eff_profile_dir = None
+                    profile_id = reg_id
+                    profile_kind = 'registered'
+                else:
+                    raise ValueError(
+                        f'profile in {eff_profile_dir} describes {", ".join(sorted(eff_builds))}, '
+                        f'which does not match package version {pkg_ver}'
+                    )
+
+        if eff_profile_dir and os.path.exists(eff_profile_dir):
             prof_kv = _read_game_tsv_kv(os.path.join(eff_profile_dir, 'game.tsv'))
             gid = profile_id or os.path.basename(os.path.normpath(eff_profile_dir))
             _validate_rel_path(gid, 'profile_id')
