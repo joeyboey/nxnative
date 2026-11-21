@@ -17,7 +17,9 @@ import sys
 
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO / 'dm/games'))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import game
+import project_sdk
 
 
 def main():
@@ -37,13 +39,8 @@ def main():
     tables.mkdir(parents=True)
     for name in ('Sources', 'tools'):
         (project / name).symlink_to(ios / name, target_is_directory=True)
-    spec = (ios / 'project.yml').read_text()
-    if sdk == 'xros':   # the same project for visionOS: its platform, deployment target and device family (7, Apple Vision)
-        for old, new in (('    iOS: "26.0"', '    visionOS: "26.0"'), ('    platform: iOS\n', '    platform: visionOS\n'),
-                         ('TARGETED_DEVICE_FAMILY: "1,2"', 'TARGETED_DEVICE_FAMILY: "7"')):
-            if spec.count(old) != 1: raise RuntimeError(f'project.yml: expected one {old.strip()!r}')
-            spec = spec.replace(old, new)
-    (project / 'project.yml').write_text(spec)
+    # The same project for the SDK: project_sdk.py writes visionOS's platform, deployment target and device family (7, Apple Vision)
+    (project / 'project.yml').write_text(project_sdk.convert((ios / 'project.yml').read_text(), sdk))
     assets = gen / 'Assets.xcassets'
     assets.mkdir()
     (assets / 'Contents.json').write_text(json.dumps({'info': {'author': 'xcode', 'version': 1}}))
