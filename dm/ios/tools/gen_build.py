@@ -6,11 +6,14 @@
 #                     which only Mac code under TARGET_OS_OSX uses, would fail the link; each one left out is named on stderr)
 # Usage: gen_build.py <dm/host dir> <Gen dir>
 import os, shlex, subprocess, sys
+# DM_SDK: the SDK the app is built for, iphoneos (the default) or xros (visionOS: the same sources, dm/ios/tools/build_smoke.py)
+SDK = os.environ.get('DM_SDK') or 'iphoneos'
+if SDK not in ('iphoneos', 'xros'): sys.exit(f'gen_build: DM_SDK={SDK}: iphoneos or xros')
 host, gen = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
 # Generate the game profile header and the host's shaders compiled for iOS (MSL_SDK=iphoneos: gen/msl-iphoneos, dm/gfx/tools/host_msl.py) for real first (make -n below only prints;
 # GAME comes from the environment). The compile command is then the iOS one: its -I names the iOS shader header
-subprocess.run(['make', '-s', '-C', host, 'game_profile', 'host_msl', 'MSL_SDK=iphoneos'], check=True)
-cmd = subprocess.run(['make', '-s', '-n', '-B', '-C', host, 'dmhost', 'MSL_SDK=iphoneos'], capture_output=True, text=True, check=True).stdout
+subprocess.run(['make', '-s', '-C', host, 'game_profile', 'host_msl', f'MSL_SDK={SDK}'], check=True)
+cmd = subprocess.run(['make', '-s', '-n', '-B', '-C', host, 'dmhost', f'MSL_SDK={SDK}'], capture_output=True, text=True, check=True).stdout
 # The host's own commands first (its per-source compiles and its link), then the per-file compile commands of the libraries it depends on (libvpx, dav1d: their objects go to
 # gen/vpx and gen/dav1d): header paths keep this order, so the host's headers are found first
 lines = [shlex.split(l) for l in cmd.splitlines() if l.lstrip().startswith('clang')]
@@ -43,8 +46,8 @@ for s in srcs:
     os.symlink(s, f'{gen}/src/{flat}')
 print('HEADER_SEARCH_PATHS = $(inherited) ' + ' '.join(f'"{d}"' for d in incs + dirs))
 print('OTHER_CFLAGS = $(inherited) ' + ' '.join(defs))
-sdk = subprocess.run(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], capture_output=True, text=True, check=True).stdout.strip()
+sdk = subprocess.run(['xcrun', '--sdk', SDK, '--show-sdk-path'], capture_output=True, text=True, check=True).stdout.strip()
 fws = list(dict.fromkeys(fws))
 mac_only = [f for f in fws if not os.path.isdir(f'{sdk}/System/Library/Frameworks/{f}.framework')]
-if mac_only: print('gen_build: not in the iOS SDK, left out of the link: ' + ' '.join(mac_only), file=sys.stderr)
+if mac_only: print(f'gen_build: not in the {SDK} SDK, left out of the link: ' + ' '.join(mac_only), file=sys.stderr)
 print('DM_FRAMEWORKS = ' + ' '.join(f'-framework {f}' for f in fws if f not in mac_only))

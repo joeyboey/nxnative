@@ -58,6 +58,7 @@ $(DAV1D_LIB): $(DAV1D_OBJ)
 MSL_SDK ?= macosx
 MSL_MIN_macosx = $(MACOS_MIN)
 MSL_MIN_iphoneos = 26.0
+MSL_MIN_xros = 26.0
 MSL_SRC = $(sort $(wildcard ../gfx/msl/*.metal))
 MSL_H = gen/msl-$(MSL_SDK)/host_msl_gen.h
 # Recheck the toolchain and target on every build; the generator keeps the header unchanged when its inputs match.

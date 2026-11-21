@@ -24,6 +24,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', required=True, type=Path, help='new scratch directory for inputs and build products')
     args = parser.parse_args()
+    parser_sdk = os.environ.get('DM_SDK') or 'iphoneos'   # iphoneos, or xros: the same build for visionOS (gen_build.py reads it too)
+    if parser_sdk not in ('iphoneos', 'xros'): raise SystemExit(f'DM_SDK={parser_sdk}: iphoneos or xros')
+    sdk, osname = parser_sdk, 'visionOS' if parser_sdk == 'xros' else 'iOS'
     profile = game.load(os.environ.get('GAME') or os.environ.get('DM_GAME'))
     root = args.output.resolve()
     root.mkdir(parents=True)  # Never overwrite an existing project or build.
@@ -34,7 +37,13 @@ def main():
     tables.mkdir(parents=True)
     for name in ('Sources', 'tools'):
         (project / name).symlink_to(ios / name, target_is_directory=True)
-    shutil.copyfile(ios / 'project.yml', project / 'project.yml')
+    spec = (ios / 'project.yml').read_text()
+    if sdk == 'xros':   # the same project for visionOS: its platform, deployment target and device family (7, Apple Vision)
+        for old, new in (('    iOS: "26.0"', '    visionOS: "26.0"'), ('    platform: iOS\n', '    platform: visionOS\n'),
+                         ('TARGETED_DEVICE_FAMILY: "1,2"', 'TARGETED_DEVICE_FAMILY: "7"')):
+            if spec.count(old) != 1: raise RuntimeError(f'project.yml: expected one {old.strip()!r}')
+            spec = spec.replace(old, new)
+    (project / 'project.yml').write_text(spec)
     assets = gen / 'Assets.xcassets'
     assets.mkdir()
     (assets / 'Contents.json').write_text(json.dumps({'info': {'author': 'xcode', 'version': 1}}))
@@ -51,7 +60,7 @@ def main():
                           '# KEY_PAGE_OFF 0x8000\n# KEY_PAGE_SIZE 0x4000\n')
         shutil.copyfile(fixups, tables / fixups.name)
 
-    env = dict(os.environ, GAME=profile.id, DM_GAME=profile.id,
+    env = dict(os.environ, GAME=profile.id, DM_GAME=profile.id, DM_SDK=sdk,
                DM_BUNDLE_ID='org.nxnative.ci', DM_DISPLAY_NAME='CI build fixture',
                DM_APP_VERSION='1.0', DM_APP_CATEGORY=profile.get('app_category'),
                DM_TEAM_ID='', DM_SCHEME_NAME='DmIOS', DM_APPICON='',
@@ -81,13 +90,13 @@ def main():
     run(sys.executable, ios / 'tools/gen_resources.py', project, romfs, marker,
         shaders, f'b-{chain}', '', derived, chain_h)
     run('xcodebuild', '-project', project / 'DmIOS.xcodeproj', '-scheme', 'DmIOS',
-        '-configuration', 'Release', '-destination', 'generic/platform=iOS',
+        '-configuration', 'Release', '-destination', f'generic/platform={osname}',
         '-derivedDataPath', derived, '-jobs', '3',
         'CODE_SIGNING_ALLOWED=NO', 'CODE_SIGNING_REQUIRED=NO', 'CODE_SIGN_IDENTITY=',
         f'DM_XCODE_OUTPUT_ROOT={derived}', f'SYMROOT={derived}/Build/Products',
         f'OBJROOT={derived}/Build/Intermediates.noindex', 'build')
 
-    app = derived / 'Build/Products/Release-iphoneos/DmIOS.app'
+    app = derived / f'Build/Products/Release-{sdk}/DmIOS.app'
     info = plistlib.loads((app / 'Info.plist').read_bytes())
     executable = app / info['CFBundleExecutable']
     if not executable.is_file():
@@ -98,7 +107,7 @@ def main():
             raise RuntimeError(f'Resource staging failed: {packed}')
     if (app / '_CodeSignature').exists() or (app / 'embedded.mobileprovision').exists():
         raise RuntimeError('The smoke-test app must be unsigned')
-    print(f'iOS smoke build passed: {executable}', flush=True)
+    print(f'{osname} smoke build passed: {executable}', flush=True)
 
 
 if __name__ == '__main__':

@@ -228,7 +228,11 @@ private struct LauncherView: View {
 
     @ViewBuilder var playButton: some View {
         let button = Button(action: start) { Text("Play").font(.title3.weight(.semibold)).frame(maxWidth: 220) }.controlSize(.large).disabled(checking)
+        #if os(visionOS)   // no Liquid Glass button styles on visionOS
+        button.buttonStyle(.borderedProminent)
+        #else
         if #available(iOS 26.0, *) { button.buttonStyle(.glassProminent) } else { button.buttonStyle(.borderedProminent) }
+        #endif
         if checking {
             VStack(spacing: 6) {
                 HStack(spacing: 6) { ProgressView(); Text("Checking the cloud save…").font(.callout).foregroundStyle(.secondary) }
