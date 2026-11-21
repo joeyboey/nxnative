@@ -418,6 +418,10 @@ DM_SCREEN_ASPECT_SITES	diagnostic	`=<mask>` with DM_SCREEN_ASPECT: which of the 
 DM_SCREEN_FOV	diagnostic	`off` with DM_SCREEN_ASPECT: the scene keeps the game's vertical angle (narrower sides) instead of 16:9's sides with more above and below
 DM_SCREEN_HUD	diagnostic	`=<edge>,<listed>,<full width>,<full height>[,<tallest>]` with DM_SCREEN_ASPECT: the layout rules' distances and sizes in the 1280x720 space (default 280,100,1270,710,1300)
 DM_SCREEN_MATCH	switch	`0` keeps the screen's refresh rate in fullscreen; by default a Mac screen whose rate is not a multiple of the game's frame rate switches to one that is (144 → 120 Hz), and a variable-refresh screen to a fixed-rate mode at a multiple (ProMotion 120 → 60 Hz at 60 and 30 fps)
+<<<<<<< HEAD
+=======
+DM_SDK	switch	the SDK the iOS app's build tools target (`dm/ios/tools/gen_build.py`, `build_smoke.py`, `build_ipa.sh`): `iphoneos` (the default) or `xros`, which builds the same app, game framework or project for visionOS (platform, deployment target and device family 7 through `tools/project_sdk.py`). The NSP script's `--platform visionos` sets it (`scripts/build_ipa_from_nsp.py`)
+>>>>>>> 2c630d0 (NX2Apple: generated files (indexes, dm/fork_patches.txt))
 DM_SEED_CACHE_DIR	path	`=<dir>` overrides the root directory where `build_seed.py`, the launchers, and `--from-seed` read and persist build seed caches, defaulting to `<appDataDir>/nxnative/build-seeds`
 DM_SF_TRACE	diagnostic	`=1` logs every request on the game's own HIPC client sessions that the host answers (`hle_sf.c`)
 DM_SHADER_FILES	switch	`1` packs an NVN game's shader library into the unsigned IPA of `build_ipa.sh` as its separate files, `msl/b-<chain>/`, not as the one file `b-<chain>.img`, for install tools that cannot copy a large file (AltServer: 2 GiB) (`pack_ipa.py --shader-files`; off by default; `--shader-files` of the NSP script sets this)

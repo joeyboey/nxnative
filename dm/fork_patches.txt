@@ -56,3 +56,12 @@ game-resplit-nintendo-switch-sports-resort-shade
 build-seed-fix-zero-inode-loop-detection-and-sta
 packing-nsp-derive-shader-map-when-only-main-dup
 packing-shaders-refresh-stardew-valley-animal-cr
+<<<<<<< HEAD
+=======
+visionos-compile-out-metalfx-scalers-screen-brig
+visionos-build-and-smoke-test-the-ios-app-for-xr
+build-build-ipa-sh-builds-the-app-the-framework
+shaders-xros-metal-py-runs-the-chain-tools-with
+nsp-script-platform-visionos-builds-a-game-for-a
+ios-compile-the-host-and-the-front-end-for-visio
+>>>>>>> 2c630d0 (NX2Apple: generated files (indexes, dm/fork_patches.txt))
