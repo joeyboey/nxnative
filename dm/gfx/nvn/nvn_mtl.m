@@ -24,6 +24,12 @@
 #endif
 #include "nvn_mtl.h"
 #include "nvn_queue.h"
+// visionOS marks MetalFX's Metal 4 scalers (MTL4FXTemporalScaler, MTL4FXSpatialScaler) unavailable: DM_MFX is 0 there, so the DLSS, present-upscale and game-upscaler scaler paths are compiled out and each falls back to what it does without MetalFX (the bilinear draw, or the game's own shader)
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+#define DM_MFX 0
+#else
+#define DM_MFX 1
+#endif
 #include <mach/mach.h>
 #include "nvn_obj.h"
 #include "../tex/nvn_fmt_mtl.h"
@@ -17587,10 +17593,11 @@ static id<MTLRenderPipelineState> dlss_alpha_pso(MTLPixelFormat pf) {
     return ps;
 }
 
+static id<MTL4Compiler> g_dlss_comp;   // Metal 4's compiler is available on visionOS; only the temporal scaler is not
+#if DM_MFX
 typedef struct { uint64_t net, used; id<MTL4FXTemporalScaler> sc; NSUInteger key[10]; float lo, hi; int fresh, mask; } dlss_scaler;
 static dlss_scaler g_dlss[4];
 static uint64_t g_dlss_use;
-static id<MTL4Compiler> g_dlss_comp;
 static void dlss_scaler_drop(dlss_scaler *e) { if (e->sc) defer_obj_release(e->sc); e->sc = nil; }
 static dlss_scaler *dlss_scaler_for(const p_dlss *c, id<MTLTexture> col, id<MTLTexture> dep, id<MTLTexture> mot, id<MTLTexture> out, id<MTLTexture> bias, NSUInteger iw, NSUInteger ih) {
     NSUInteger bw = MIN(col.width, MIN(dep.width, mot.width)), bh = MIN(col.height, MIN(dep.height, mot.height));   // the input box every texture holds
@@ -17628,6 +17635,7 @@ static dlss_scaler *dlss_scaler_for(const p_dlss *c, id<MTLTexture> col, id<MTLT
               e->mask ? (unsigned long)bias.pixelFormat : 0ul);
     return e->sc ? e : NULL;
 }
+#endif   // DM_MFX
 // MetalFX's Metal 4 scalers open encoders of their own with no barrier, before or after their work. Before them, in cb: an encoder that waits for the queue's earlier work and
 // holds the queue's later work (the scaler's encoders) behind its own, a copy: from src's region at o into dst at the origin when the caller copies (the present's crop), else
 // one word of a scratch buffer. Barriers around no work order nothing (An encoder of barriers alone orders nothing, docs/reference/rendering.md): behind an empty encoder of
@@ -17670,16 +17678,22 @@ static void dlss_eval(const p_dlss *c) {
     rp_end(); if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     // Diagnostic DM_NVN_DLSS_BILINEAR=1 (off by default): every evaluation takes the bilinear stand-in below, to tell MetalFX's part in a GPU fault or stall
     static int bilinear = -1; if (bilinear < 0) { const char *be = getenv("DM_NVN_DLSS_BILINEAR"); bilinear = be && atoi(be); if (bilinear) MLOG("DM_NVN_DLSS_BILINEAR: DLSS drawn bilinear (diagnostic)"); }
+#if DM_MFX
     dlss_scaler *e = dep && mot && !bilinear ? dlss_scaler_for(c, col, dep, mot, out, bias, iw, ih) : NULL;
     int keep_alpha = (mtl_pf_chmask(out.pixelFormat) & 8) != 0;
     id<MTLRenderPipelineState> alpha_ps = e && keep_alpha ? dlss_alpha_pso(out.pixelFormat) : nil;
     if (e && keep_alpha && !alpha_ps) e = NULL;   // a bilinear draw preserves all channels; never accept MetalFX's opaque output when alpha cannot be restored
+#else
+    void *e = NULL;   // visionOS: no MetalFX temporal scaler, so every evaluation takes the bilinear stand-in below
+    { static int once; if (!once++) MLOG("[RED] DLSS: visionOS has no MetalFX temporal scaler; scaling bilinearly"); }
+#endif
     if (!e) {
         NVNcopyRegion sr = {c->base[DLSS_COLOR][0], c->base[DLSS_COLOR][1], 0, (int)iw, (int)ih, 1}, dr = {c->base[DLSS_OUTPUT][0], c->base[DLSS_OUTPUT][1], 0, (int)out.width, (int)out.height, 1};
         if (!(out.usage & MTLTextureUsageRenderTarget) && !mtl_fmt_block(out.pixelFormat) && !fmt_int_or_ds(out.pixelFormat)) out = tex_upgrade(c->tex[DLSS_OUTPUT], out, MTLTextureUsageRenderTarget, out.pixelFormat);
         if (!copy_t2t_draw(col, out, 0, 0, 0, 0, &sr, &dr, 1, 0)) { static int once; if (!once++) MLOG("[RED] DLSS: the bilinear stand-in could not draw format %lu into format %lu", (unsigned long)col.pixelFormat, (unsigned long)out.pixelFormat); }
         return;
     }
+#if DM_MFX
     id<MTL4FXTemporalScaler> sc = e->sc;
     MTLTextureUsage col_use = sc.colorTextureUsage | (keep_alpha ? MTLTextureUsageShaderRead : 0);
     MTLTextureUsage out_use = sc.outputTextureUsage | (keep_alpha ? MTLTextureUsageRenderTarget : 0);
@@ -17751,6 +17765,7 @@ static void dlss_eval(const p_dlss *c) {
             [en setRenderPipelineState:alpha_ps]; [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3]; m4_end(en);
         }
     });
+#endif   // DM_MFX
 }
 
 // The colour channels a Metal format has, as a channel write mask: a clear whose mask covers them all writes every texel whole (FINAL FANTASY TACTICS - The Ivalice Chronicles clears an
@@ -18759,10 +18774,15 @@ static int present_encode(id<MTLCommandBuffer> cb, id<MTLTexture> src, id<MTLTex
 // Replacing the scaler waits for earlier presents; throttle replacement during resizing, and keep standard scaling for refused sizes. Offscreen captures own separate state.
 #define FX_REMAKE_PRESENTS 30
 // in, out: the scaler's own input and output (nil until needed); in_place_n, direct_n: presents that read the presented texture, wrote the canvas
+#if DM_MFX
 typedef struct { id<MTL4FXSpatialScaler> sc; id<MTLTexture> in, out; uint64_t made_at, in_place_n, direct_n; int made; NSUInteger refused[6]; } fx_state;
+#else
+typedef struct { id<MTLTexture> in, out; } fx_state;   // visionOS: no MetalFX spatial scaler; the present scales bilinearly
+#endif
 static fx_state g_fx_present;   // only the present thread encodes or replaces the scaler
 static id<MTL4Compiler> g_fx_comp;
 static int g_fx_mode = -1;   // 1 = metalfx, 0 = off
+#if DM_MFX
 static int fx_mode(void) {
     if (g_fx_mode >= 0) return g_fx_mode;
     const char *e = getenv("DM_PRESENT_UPSCALE"); int v = 0;
@@ -18833,6 +18853,11 @@ static id<MTLTexture> fx_encode(fx_state *fx, id<MTL4CommandBuffer> cb, id<MTLTe
     *wrote = direct;
     return out;
 }
+#else
+static id<MTLTexture> fx_encode(fx_state *fx, id<MTL4CommandBuffer> cb, id<MTLTexture> raw, const NSUInteger r[4], MTLViewport vp, MTLPixelFormat out_pf, int remake_wait, id<MTLTexture> canvas, int *wrote) {
+    (void)fx; (void)cb; (void)raw; (void)r; (void)vp; (void)out_pf; (void)remake_wait; (void)canvas; (void)wrote; return nil;   // visionOS: no MetalFX spatial scaler, the present pass scales bilinearly
+}
+#endif   // DM_MFX
 // ---------- A game's own upscaler drawn by MetalFX (DM_UPSCALER) ----------
 // Donkey Kong Bananza upscales its frame with agl's NDSR network: one compute dispatch (agl_ndsr.pck, 24 variants; Splatoon Raiders ships 20) reading the scene colour (texture slot 0, R11G11B10F; see up_mfx_color)
 // and writing the output picture (image slot 1), between the render-resolution passes and the output-resolution ones, which draw the UI over it. Its push constants (c[24], S.push[1])
@@ -18846,6 +18871,7 @@ static id<MTLTexture> fx_encode(fx_state *fx, id<MTL4CommandBuffer> cb, id<MTLTe
 // LDSM / MOVM shuffles, open in docs/reference/shaders.md (Ampere HMMA through simdgroup_matrix)
 // key: input w, h, output w, h, sRGB input, colour format, output format. in, out: the scaler's own input and output, made on first use (up_mfx_scratch) by a side that cannot take the game's texture;
 // read: what the game's image is drawn from (out, or its sRGB view)
+#if DM_MFX
 typedef struct { id<MTL4FXSpatialScaler> sc; id<MTLTexture> in, out, read; NSUInteger key[7]; int refused; } up_mfx_scaler;
 enum { UP_MFX_SCALERS = 8 };   // dynamic resolution moves the input, and a format MetalFX refuses keeps its slot (refused) beside the RGBA16F scaler that stands in
 static up_mfx_scaler g_up_mfx[UP_MFX_SCALERS]; static int g_up_mfx_next;
@@ -19049,6 +19075,12 @@ static int up_mfx_encode(NvShader *cs) {
                             (unsigned long)out.height, (unsigned long)out.pixelFormat, sout ? "straight" : "drawn back", srgb ? ", decoded from sRGB" : root ? ", squared from its square roots" : "");
     return 1;
 }
+#else   // DM_MFX: visionOS has no MetalFX Metal 4 scalers, so the game's own upscaler shaders run
+static void up_mfx_read_color(NvShader *cs, const NVNshaderData *sd) { (void)cs; (void)sd; }
+static int up_mfx_wanted(NvShader *cs) { (void)cs; return 0; }
+static int up_mfx_encode(NvShader *cs) { (void)cs; return 0; }
+void mtl_up_mfx_stats(uint64_t *n, uint64_t *kept) { *n = 0; *kept = 0; }
+#endif
 // The present pass: src's valid rectangle drawn into dst (the drawable, or a screenshot's texture) as present_encode draws it, through MetalFX first where fx_encode takes it
 // (fx: the scaler state to use, nil = bilinear). uvb: the pass's crop constants (one buffer per present allocator, written by the CPU)
 static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MTLTexture> dst, const int crop[4], id<MTLBuffer> uvb, fx_state *fx) {
@@ -20278,6 +20310,7 @@ void dm_gfx_teardown(void) { @autoreleasepool {
     res_remove(g_fx_present.in); res_remove(g_fx_present.out);
     g_fx_present = (fx_state){0};
     g_fx_mode = -1;
+#if DM_MFX
     for (int i = 0; i < UP_MFX_SCALERS; i++) {
         res_remove(g_up_mfx[i].in);
         res_remove(g_up_mfx[i].out);
@@ -20286,6 +20319,7 @@ void dm_gfx_teardown(void) { @autoreleasepool {
     g_up_mfx_next = 0; g_up_mfx_n = 0; g_up_mfx_kept = 0;
     g_up_mfx_straight[0] = g_up_mfx_straight[1] = 0;
     g_up_mfx_mode = -1;
+#endif
     g_comp4 = nil; g_dlss_comp = nil; g_fx_comp = nil;
 
     g_arenas = nil; g_sub_arenas = nil; g_cur_arena = nil;

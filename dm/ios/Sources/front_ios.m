@@ -28,6 +28,21 @@ typedef void (*dm_shell_return_fn)(void);
 static void quit_close(void);
 #import "DmLayout.h"
 #import "DmGameMenu.h"
+#include <TargetConditionals.h>
+// visionOS has no UIScreen: a window is a panel in the room, with no screen of its own, no brightness and no external display. DM_VISION is 1 there
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+#define DM_VISION 1
+#else
+#define DM_VISION 0
+#endif
+// The pixels per point of the screen a scene is on; on visionOS, and for a view in no window, the scale of the view's traits
+static CGFloat dm_scene_scale(UIWindowScene *scene, CGFloat fallback) {
+#if DM_VISION
+    (void)scene; return fallback;
+#else
+    UIScreen *screen = scene.screen; return screen ? screen.nativeScale : fallback;
+#endif
+}
 
 void front_ios_boot(void);
 int front_ios_boot_ok(void);
@@ -67,8 +82,7 @@ static UILabel *front_ios_fps_label(void);
 - (void)layoutSubviews {   // render at the pixels of the screen the view is on (an iPad window can move to another), at most maxPixelWidth across
     [super layoutSubviews];
     CAMetalLayer *l = (CAMetalLayer *)self.layer;
-    UIScreen *screen = self.window.windowScene.screen;
-    CGFloat scale = screen ? screen.nativeScale : MAX(self.traitCollection.displayScale, 1);
+    CGFloat scale = dm_scene_scale(self.window.windowScene, MAX(self.traitCollection.displayScale, 1));
     if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));
     l.contentsScale = scale;
     screen_refresh();   // an iPad window moved to another display lays out again (the display scale trait above)
@@ -143,7 +157,7 @@ static void launcher_done(void) { [g_root startGame]; }
         [self showHint:why ? [NSString stringWithFormat:@"Game files unusable.\n%s", why] : @"Game files not found.\nPut the RomFS folder into this App's Documents as \"romfs\" (Files app), then restart."]; return;
     }
     front_ios_audio_watch();
-#if defined(__IPHONE_27_0)   // compiled only with an SDK that has the scene accessory API
+#if defined(__IPHONE_27_0) && !DM_VISION   // compiled only with an SDK that has the scene accessory API (visionOS has no external display)
     if (@available(iOS 27.0, *)) {   // iOS 27 offers a TV scene only to a registered scene accessory, no longer from the Info.plist entry alone (that path stays for iOS 26)
         UISceneConfiguration *c = [[UISceneConfiguration alloc] initWithName:@"TV" sessionRole:UIWindowSceneSessionRoleExternalDisplayNonInteractive];
         c.delegateClass = DmTVSceneDelegate.class;
@@ -183,7 +197,12 @@ static void launcher_done(void) { [g_root startGame]; }
         // host writes the state page (main.c dm_fps_state_apply)
         const char *a = getenv("DM_SCREEN_ASPECT");
         if (a && !strcmp(a, "auto")) {
-            CGSize sz = self.view.window ? self.view.window.bounds.size : UIScreen.mainScreen.bounds.size; double r = MAX(sz.width, sz.height) / MAX(MIN(sz.width, sz.height), 1);
+#if DM_VISION
+            CGSize sz = self.view.window ? self.view.window.bounds.size : self.view.bounds.size;
+#else
+            CGSize sz = self.view.window ? self.view.window.bounds.size : UIScreen.mainScreen.bounds.size;
+#endif
+            double r = MAX(sz.width, sz.height) / MAX(MIN(sz.width, sz.height), 1);
             char v[16]; if (r >= 1.3 && r < 1.77) snprintf(v, sizeof v, "%.3f", r); else strcpy(v, "0");
             setenv("DM_SCREEN_ASPECT", v, 1); LOG("front end: picture shape auto: window %.0fx%.0f points (%.3f:1) → DM_SCREEN_ASPECT=%s", sz.width, sz.height, r, v);
         }
@@ -286,7 +305,7 @@ static void tv_attach(void) {
     // Taken from the picture, not the screen, so a display of another shape still gets the full 1920 pixels across the picture (DmGameView layoutSubviews applies it)
     v.maxPixelWidth = 1920;
     [g_tv.rootViewController.view addSubview:v]; [g_tv.rootViewController.view setNeedsLayout]; [g_root.view setNeedsLayout];   // the phone's pad takes the whole screen
-    CGRect f = dm_aspect_fit(g_tv.bounds, g_picture_aspect); CGFloat scale = MIN(g_tv.windowScene.screen.nativeScale, 1920.0 / MAX(f.size.width, 1));
+    CGRect f = dm_aspect_fit(g_tv.bounds, g_picture_aspect); CGFloat scale = MIN(dm_scene_scale(g_tv.windowScene, MAX(g_tv.traitCollection.displayScale, 1)), 1920.0 / MAX(f.size.width, 1));
     if (g_tv_mode_was < 0) g_tv_mode_was = dm_opmode();
     dm_set_opmode(1); dm_gamepad_opmode_changed();
     LOG("front end: TV connected (%.0fx%.0f points), the picture moves there at %.0fx%.0f, console mode", g_tv.bounds.size.width, g_tv.bounds.size.height, f.size.width * scale, f.size.height * scale);
@@ -371,8 +390,10 @@ int dm_thermal_now(void) { return (int)NSProcessInfo.processInfo.thermalState; }
 int dm_low_power_now(void) { return NSProcessInfo.processInfo.lowPowerModeEnabled; }   // the frame step does not probe in it (hle_nvn.c fstep_cpu_slowed)
 double dm_brightness_now(void) { return g_brightness; }
 static void front_ios_power_watch(void) {
+#if !DM_VISION   // no screen brightness on visionOS: it stays -1, as on the Mac
     g_brightness = UIScreen.mainScreen.brightness;
     g_obs[0] = [NSNotificationCenter.defaultCenter addObserverForName:UIScreenBrightnessDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) { (void)n; g_brightness = UIScreen.mainScreen.brightness; }];
+#endif
     g_obs[1] = [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoThermalStateDidChangeNotification object:nil queue:nil usingBlock:^(NSNotification *n) {
         (void)n; LOG("front end: thermal state → %d (%.0f s after launch)", dm_thermal_now(), (now_ns() - g_t0_ns) / 1e9); }];
     g_obs[2] = [NSNotificationCenter.defaultCenter addObserverForName:NSProcessInfoPowerStateDidChangeNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
@@ -433,9 +454,13 @@ void front_progress(const char *title, long done, long total) {
 }
 void *front_metal_layer(void) { return (__bridge void *)g_layer; }
 int front_display_pixels(int *w, int *h) {   // the screen in pixels, landscape (nativeBounds is portrait); UIScreen's sizes may be read from any thread
+#if DM_VISION   // no screen to measure: the docked picture takes its default, 1920x1080 (hle_vi.c)
+    (void)w; (void)h; return 0;
+#else
     CGRect b = UIScreen.mainScreen.nativeBounds; int a = (int)b.size.width, c = (int)b.size.height;
     if (a <= 0 || c <= 0) return 0;
     *w = a > c ? a : c; *h = a > c ? c : a; return 1;
+#endif
 }
 // The highest frame rate of the screen the game is shown on (front.h), which the 120 fps path needs at 120: hle_nvn.c high_cap_tick caps at 60 on a screen below 120 Hz,
 // and the display link follows it (nvn_mtl.m link_range, link_sync). Read on the main thread, as the Mac front end does (front_mac.m screen_refresh), whenever it can change:
@@ -445,6 +470,9 @@ int front_display_pixels(int *w, int *h) {   // the screen in pixels, landscape 
 static _Atomic int g_screen_hz;
 int front_screen_max_fps(void) { return atomic_load_explicit(&g_screen_hz, memory_order_relaxed); }
 static void screen_refresh(void) {
+#if DM_VISION   // no screen rate on visionOS: front_screen_max_fps stays 0, the display link keeps its own rate
+    return;
+#else
     UIWindowScene *ws = (g_root.game ?: g_root.view).window.windowScene;
     if (!ws) for (UIScene *s in UIApplication.sharedApplication.connectedScenes)
         if ([s isKindOfClass:UIWindowScene.class] && [s.session.role isEqualToString:UIWindowSceneSessionRoleApplication]) { ws = (UIWindowScene *)s; break; }
@@ -453,6 +481,7 @@ static void screen_refresh(void) {
     if (lpm && hz > 60) hz = 60;
     int was = atomic_exchange_explicit(&g_screen_hz, hz, memory_order_relaxed);
     if (was && was != hz) LOG("front end: screen %d Hz → %d Hz%s", was, hz, lpm ? " (Low Power Mode)" : "");
+#endif
 }
 // Offline HTML pages (web_apple.m): the page's view goes over the game view and under the gamepad, which lets touches on no control through to it while the page is
 // shown (DmGamepad.m hitTest); the page takes them as a click on what they land on, and the gamepad and controllers drive it as on the Switch

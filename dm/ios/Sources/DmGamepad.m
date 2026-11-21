@@ -23,6 +23,13 @@
 #import <CoreMotion/CoreMotion.h>
 #import <CoreText/CoreText.h>
 #include <pthread.h>
+#include <TargetConditionals.h>
+// Tap feedback for the touch controls (UIImpactFeedbackGenerator): visionOS has none
+#if defined(TARGET_OS_VISION) && TARGET_OS_VISION
+#define DM_TOUCH_FEEDBACK 0
+#else
+#define DM_TOUCH_FEEDBACK 1
+#endif
 #include "dm.h"
 #include "dm_input.h"
 #include "front.h"
@@ -173,7 +180,9 @@ static void pads_start(void);   // Physical controllers, below
     NSString *_padHintWords; BOOL _padHintShown;
     unsigned _menuGen;                             // generation counter for the controller-idle menu fade timer
     BOOL _menuOpen;                                // the in-game menu is currently presented
+#if DM_TOUCH_FEEDBACK
     UIImpactFeedbackGenerator *_touchFeedback;       // one short feedback per touch-control press edge
+#endif
     unsigned _hapticSticks;
     BOOL _stickShown;                              // the left stick was held at the last refresh
     BOOL _full, _tap;                              // the 3D layout / the Tap layout is current
@@ -218,11 +227,13 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
             [(UIView *)environment setNeedsLayout];
         }];
         self.multipleTouchEnabled = YES; self.opaque = NO; self.backgroundColor = UIColor.clearColor;
+#if DM_TOUCH_FEEDBACK
         const char *feedback = getenv("DM_TOUCH_HAPTICS");
         if (!feedback || atoi(feedback)) {
             _touchFeedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
             [_touchFeedback prepare];
         }
+#endif
         _owner = [NSMapTable strongToStrongObjectsMapTable]; _faceOf = [NSMapTable strongToStrongObjectsMapTable];
         if (!k_idle) {
             // each colour carries its own low opacity instead of lowering the whole view's alpha (that would add an off-screen pass for the full-screen layer)
@@ -295,8 +306,12 @@ static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   
     [self reset]; _tap = NO; _full = NO; [self applyLayout]; [self setNeedsLayout];
 }
 - (void)setTouchFeedback:(BOOL)on {
+#if DM_TOUCH_FEEDBACK
     if (!on) { _touchFeedback = nil; return; }
     if (!_touchFeedback) { _touchFeedback = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight]; [_touchFeedback prepare]; }
+#else
+    (void)on;
+#endif
 }
 
 // ---- Layout (points; computed inside the safe area) ----
@@ -393,9 +408,11 @@ static int lockedKey(int c) {   // DmPadGeometry.h's control → the key it pres
     BOOL changed = face != _faceBits || dpad != _dpadBits || btn != _btnBits;
     uint64_t pressed = (face | dpad | btn) & ~(_faceBits | _dpadBits | _btnBits);
     unsigned gripping = (_stick[0] ? 1u : 0) | (_stick[1] ? 2u : 0);
+#if DM_TOUCH_FEEDBACK
     if (pressed || (gripping & ~_hapticSticks)) {
         [_touchFeedback impactOccurredWithIntensity:0.6]; [_touchFeedback prepare];
     }
+#endif
     _hapticSticks = gripping;
     _faceBits = face; _dpadBits = dpad; _btnBits = btn;
     pthread_mutex_lock(&g_mu);
